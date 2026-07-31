@@ -80,6 +80,32 @@ function getScope(store, id) {
   return store.scopes[id];
 }
 
+function updateActor(scope, source) {
+  if (!source.userId) return;
+  scope.actorUserId = source.userId;
+  scope.actorName ||= "你";
+}
+
+async function hydrateActorName(scope, source) {
+  if (!source.userId || scope.people?.[scope.actorName]?.userId === source.userId) return;
+  try {
+    let profile = null;
+    if (source.groupId) {
+      profile = await client.getGroupMemberProfile(source.groupId, source.userId);
+    } else if (source.roomId) {
+      profile = await client.getRoomMemberProfile(source.roomId, source.userId);
+    } else {
+      profile = await client.getProfile(source.userId);
+    }
+    if (profile?.displayName) {
+      scope.actorName = profile.displayName;
+      rememberPerson(scope, profile.displayName, source.userId);
+    }
+  } catch {
+    // Profile access can fail if permissions or membership are unavailable; keep a readable fallback.
+  }
+}
+
 function nowParts() {
   const parts = new Intl.DateTimeFormat("en-CA", {
     timeZone: TZ,
@@ -273,7 +299,7 @@ function applyDebt(store, scope, parsed, raw) {
       scope.debts.push(item);
       created.push(item);
     }
-    return debtTextMessage(scope, `已分帳\n總金額：${formatMoney(parsed.amount)}\n人數：${parsed.people.length}\n每人：${formatMoney(parsed.share)}\n已記錄：${others.map((p) => `${mentionToken(scope, p)} 欠你 ${formatMoney(parsed.share)}`).join("、")}`);
+    return debtTextMessage(scope, `已分帳\n總金額：${formatMoney(parsed.amount)}\n人數：${parsed.people.length}\n每人：${formatMoney(parsed.share)}\n已記錄：${others.map((p) => `${mentionToken(scope, p)} 欠${actorToken(scope)} ${formatMoney(parsed.share)}`).join("、")}`);
   }
 
   const item = newDebt(store, { ...parsed, raw });
@@ -312,8 +338,8 @@ function debtSummary(scope, person) {
   return debtTextMessage(scope, [...totals.entries()]
     .map(([name, value]) => {
       const token = mentionToken(scope, name);
-      if (value > 0) return `${token} 欠你 ${formatMoney(value)}`;
-      if (value < 0) return `你欠 ${token} ${formatMoney(Math.abs(value))}`;
+      if (value > 0) return `${token} 欠${actorToken(scope)} ${formatMoney(value)}`;
+      if (value < 0) return `${actorToken(scope)} 欠 ${token} ${formatMoney(Math.abs(value))}`;
       return `${token} 已互相結清`;
     })
     .join("\n"));
@@ -350,6 +376,10 @@ function mentionToken(scope, person) {
   return personUserId(scope, person) ? `{${personKey(person)}}` : person;
 }
 
+function actorToken(scope) {
+  return mentionToken(scope, scope.actorName || "你");
+}
+
 function personKey(person) {
   return `u_${Buffer.from(person).toString("hex").slice(0, 18)}`;
 }
@@ -371,10 +401,11 @@ function debtTextMessage(scope, text) {
 
 function formatDebtLine(d, scope) {
   const person = mentionToken(scope, d.person);
-  if (d.direction === "me_owe") return `你欠 ${person} ${formatMoney(d.amount)}`;
-  if (d.direction === "they_owe") return `${person} 欠你 ${formatMoney(d.amount)}`;
-  if (d.direction === "paid_to_them") return `你還 ${person} ${formatMoney(d.amount)}`;
-  return `${person} 還你 ${formatMoney(d.amount)}`;
+  const actor = actorToken(scope);
+  if (d.direction === "me_owe") return `${actor} 欠 ${person} ${formatMoney(d.amount)}`;
+  if (d.direction === "they_owe") return `${person} 欠${actor} ${formatMoney(d.amount)}`;
+  if (d.direction === "paid_to_them") return `${actor} 還 ${person} ${formatMoney(d.amount)}`;
+  return `${person} 還${actor} ${formatMoney(d.amount)}`;
 }
 
 function applyBarePaid(store, scope, parsed, raw) {
@@ -394,10 +425,10 @@ function applyBarePaid(store, scope, parsed, raw) {
     return { changed: true, reply: debtTextMessage(scope, `已記錄 D${item.id}\n${formatDebtLine(item, scope)}\n時間：${formatDateTime(item.createdAt)}`) };
   }
   if (!candidates.length) {
-    return { changed: false, reply: "目前沒有你欠別人的帳。請改成：已還@A 350" };
+    return { changed: false, reply: `${scope.actorName || "你"}目前沒有欠別人的帳。請改成：已還@A 350` };
   }
-  const list = candidates.map(([person, balance]) => `${person}：你欠 ${formatMoney(Math.abs(balance))}`).join("\n");
-  return { changed: false, reply: `請補人名，避免記錯。\n例：已還@A ${formatMoney(parsed.amount)}\n\n目前你欠：\n${list}` };
+  const list = candidates.map(([person, balance]) => `${person}：${scope.actorName || "你"}欠 ${formatMoney(Math.abs(balance))}`).join("\n");
+  return { changed: false, reply: `請補人名，避免記錯。\n例：已還@A ${formatMoney(parsed.amount)}\n\n目前${scope.actorName || "你"}欠：\n${list}` };
 }
 
 function parseEvent(text) {
@@ -527,6 +558,8 @@ async function handleText(message, source) {
   const targets = mentionTargets(message.text, message.mention);
   const store = await loadStore();
   const scope = getScope(store, scopeId(source));
+  updateActor(scope, source);
+  await hydrateActorName(scope, source);
 
   let reply = null;
   let changed = false;
