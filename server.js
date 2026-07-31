@@ -26,7 +26,7 @@ app.get("/", (_req, res) => {
   res.json({
     ok: true,
     name: "line-secretary-bot",
-    usage: ["欠 紜 飲料 80", "分帳 1280 我 紜 阿豪 小美", "/欠", "/欠明細 紜", "/刪欠 D3", "說明"]
+    usage: ["欠 A 飲料 80", "分帳 1280 我 A B C", "/欠", "/欠明細 A", "/刪欠 D3", "說明"]
   });
 });
 
@@ -43,6 +43,10 @@ async function handleEvent(event) {
   const text = event.message.text.trim();
   const userId = event.source.userId || "unknown";
   const reply = await runCommand(text, userId);
+
+  if (!reply) {
+    return;
+  }
 
   return client.replyMessage({
     replyToken: event.replyToken,
@@ -138,26 +142,7 @@ async function runCommand(text, userId) {
     return `已完成 #${id}：${task.contact} - ${task.content}`;
   }
 
-  return [
-    "我看不懂這句，先用下面格式：",
-    "",
-    "欠 紜 飲料 80",
-    "欠紜1000-300-20-30+300",
-    "紜欠我500",
-    "分帳 1280 我 紜 阿豪 小美",
-    "/欠",
-    "/欠 紜",
-    "明天 19:00 吃飯",
-    "8/10 19.看牙醫",
-    "/行程",
-    "/行程 今天",
-    "記 小王 明天報價要回覆",
-    "查 小王",
-    "全部",
-    "完成 3",
-    "",
-    "輸入「說明」可以看完整指令。"
-  ].join("\n");
+  return null;
 }
 
 function isHelp(text) {
@@ -191,7 +176,7 @@ function quickHelpItems() {
     { label: "欠款明細", text: "/欠明細" },
     { label: "行程", text: "/行程" },
     { label: "今天行程", text: "/行程 今天" },
-    { label: "記帳範例", text: "欠 紜 飲料 80" },
+    { label: "記帳範例", text: "欠 A 飲料 80" },
     { label: "行程範例", text: "明天 19:00 吃飯" }
   ];
 }
@@ -202,25 +187,25 @@ function helpText() {
     "",
     "1. 欠款記錄",
     "欠 對象 備註 金額",
-    "例：欠 紜 飲料 80",
-    "例：欠紜1000-300-20-30+300",
-    "例：紜 欠我 電影票 280",
-    "例：紜欠我500",
-    "例：還 紜 300",
-    "例：還紜300",
-    "例：紜還我200",
+    "例：欠 A 飲料 80",
+    "例：欠A1000-300-20-30+300",
+    "例：A 欠我 電影票 280",
+    "例：A欠我500",
+    "例：還 A 300",
+    "例：還A300",
+    "例：A還我200",
     "",
     "2. 查欠款",
     "/欠",
-    "/欠 紜",
+    "/欠 A",
     "/欠明細",
-    "/欠明細 紜",
+    "/欠明細 A",
     "/刪欠 D3",
-    "/結清 紜",
+    "/結清 A",
     "",
     "3. 分帳",
     "分帳 總金額 人1 人2 人3",
-    "例：分帳 1280 我 紜 阿豪 小美",
+    "例：分帳 1280 我 A B C",
     "沒寫「我」時，會預設你也有一起分。",
     "",
     "4. 記錄行程",
@@ -229,6 +214,7 @@ function helpText() {
     "例：明天 19:00 吃飯",
     "例：8/10 19.看牙醫",
     "例：2026/8/10 19:30 看牙醫",
+    "例：12/15-22 福岡",
     "",
     "5. 查行程",
     "/行程",
@@ -242,11 +228,11 @@ function helpText() {
     "",
     "6. 記錄事情",
     "記 對象 事項",
-    "例：記 小王 明天報價要回覆",
+    "例：記 A 明天報價要回覆",
     "",
     "7. 查某個對象",
     "查 對象",
-    "例：查 小王",
+    "例：查 A",
     "",
     "8. 看全部待辦",
     "全部",
@@ -307,7 +293,7 @@ async function handleDebtCommand(text, userId, store, now) {
   const spacedMeOwes = text.match(/^我?欠\s+(\S+)\s+(.+)$/);
   if (spacedMeOwes) {
     const parsed = parseDebtTail(spacedMeOwes[2]);
-    if (!parsed) return "欠款格式請用：欠 對象 備註 金額，例如：欠 紜 飲料 80";
+    if (!parsed) return "欠款格式請用：欠 對象 備註 金額，例如：欠 A 飲料 80";
     return addDebt(store, {
       userId,
       contact: spacedMeOwes[1].trim(),
@@ -322,7 +308,7 @@ async function handleDebtCommand(text, userId, store, now) {
   const spacedContactOwes = text.match(/^(\S+)\s+欠我\s+(.+)$/);
   if (spacedContactOwes) {
     const parsed = parseDebtTail(spacedContactOwes[2]);
-    if (!parsed) return "欠款格式請用：對象 欠我 備註 金額，例如：紜 欠我 電影票 280";
+    if (!parsed) return "欠款格式請用：對象 欠我 備註 金額，例如：A 欠我 電影票 280";
     return addDebt(store, {
       userId,
       contact: spacedContactOwes[1].trim(),
@@ -337,7 +323,7 @@ async function handleDebtCommand(text, userId, store, now) {
   const spacedMePaid = text.match(/^我?還\s+(\S+)\s+(.+)$/);
   if (spacedMePaid) {
     const parsed = parseDebtTail(spacedMePaid[2]);
-    if (!parsed) return "還款格式請用：還 對象 金額，例如：還 紜 300";
+    if (!parsed) return "還款格式請用：還 對象 金額，例如：還 A 300";
     return addDebt(store, {
       userId,
       contact: spacedMePaid[1].trim(),
@@ -352,7 +338,7 @@ async function handleDebtCommand(text, userId, store, now) {
   const spacedContactPaid = text.match(/^(\S+)\s+還我\s+(.+)$/);
   if (spacedContactPaid) {
     const parsed = parseDebtTail(spacedContactPaid[2]);
-    if (!parsed) return "還款格式請用：對象 還我 金額，例如：紜 還我 200";
+    if (!parsed) return "還款格式請用：對象 還我 金額，例如：A 還我 200";
     return addDebt(store, {
       userId,
       contact: spacedContactPaid[1].trim(),
@@ -457,7 +443,7 @@ async function splitBill(store, userId, expression, peopleText, now) {
     .filter(Boolean);
 
   if (people.length === 0) {
-    return "分帳格式請用：分帳 總金額 我 對象1 對象2，例如：分帳 1280 我 紜 阿豪 小美";
+    return "分帳格式請用：分帳 總金額 我 對象1 對象2，例如：分帳 1280 我 A B C";
   }
 
   const uniquePeople = [...new Set(people)];
@@ -467,7 +453,7 @@ async function splitBill(store, userId, expression, peopleText, now) {
   const share = roundMoney(total / participants.length);
 
   if (payers.length === 0) {
-    return "分帳至少要有一個對象，例如：分帳 1280 我 紜";
+    return "分帳至少要有一個對象，例如：分帳 1280 我 A";
   }
 
   const splitBillRecord = {
@@ -724,12 +710,13 @@ async function handleScheduleCommand(text, userId, store, now) {
 
     event.title = parsed.title;
     event.startsAt = parsed.startsAt;
+    event.endsAt = parsed.endsAt || null;
     event.updatedAt = now;
     await writeStore(store);
 
     return [
       `已修改行程 #E${event.id}`,
-      `時間：${formatDateTime(event.startsAt)}`,
+      `時間：${formatEventTime(event)}`,
       `事項：${event.title}`
     ].join("\n");
   }
@@ -744,6 +731,7 @@ async function handleScheduleCommand(text, userId, store, now) {
     userId,
     title: parsed.title,
     startsAt: parsed.startsAt,
+    endsAt: parsed.endsAt || null,
     originalText: text,
     status: "open",
     createdAt: now,
@@ -755,12 +743,48 @@ async function handleScheduleCommand(text, userId, store, now) {
 
   return [
     `已記錄行程 #E${event.id}`,
-    `時間：${formatDateTime(event.startsAt)}`,
+    `時間：${formatEventTime(event)}`,
     `事項：${event.title}`
   ].join("\n");
 }
 
 function parseScheduleText(text, now) {
+  const rangeMatch = text.match(/^(?:(\d{4})[/-])?(\d{1,2})[/-](\d{1,2})\s*[-~到至]\s*(?:(\d{1,2})[/-])?(\d{1,2})\s+(.+)$/);
+  if (rangeMatch) {
+    const nowDate = new Date(now);
+    const today = taipeiDateParts(nowDate);
+    let year = rangeMatch[1] ? Number(rangeMatch[1]) : today.year;
+    const startMonth = Number(rangeMatch[2]);
+    const startDay = Number(rangeMatch[3]);
+    const endMonth = rangeMatch[4] ? Number(rangeMatch[4]) : startMonth;
+    const endDay = Number(rangeMatch[5]);
+    const title = rangeMatch[6].trim();
+
+    if (!title || startMonth < 1 || startMonth > 12 || endMonth < 1 || endMonth > 12 || startDay < 1 || startDay > 31 || endDay < 1 || endDay > 31) {
+      return null;
+    }
+
+    let endYear = year;
+    if (endMonth < startMonth) {
+      endYear += 1;
+    }
+
+    let startsAt = taipeiDateToIso(year, startMonth, startDay, 0, 0);
+    let endsAt = taipeiDateToIso(endYear, endMonth, endDay, 23, 59);
+    if (!rangeMatch[1] && new Date(endsAt) < nowDate) {
+      year += 1;
+      endYear += 1;
+      startsAt = taipeiDateToIso(year, startMonth, startDay, 0, 0);
+      endsAt = taipeiDateToIso(endYear, endMonth, endDay, 23, 59);
+    }
+
+    if (!isValidEventDate(new Date(startsAt)) || !isValidEventDate(new Date(endsAt)) || new Date(endsAt) < new Date(startsAt)) {
+      return null;
+    }
+
+    return { title, startsAt, endsAt };
+  }
+
   const relativeMatch = text.match(/^(今天|明天|後天|大後天)\s+(\d{1,2})(?:[:.](\d{1,2}))?[.\s]*(.+)$/);
   if (relativeMatch) {
     const nowDate = new Date(now);
@@ -844,7 +868,7 @@ function formatEvents(events, filter = "") {
   const title = filter ? `行程（${filter}）：` : "行程：";
   const rows = events
     .sort((a, b) => new Date(a.startsAt) - new Date(b.startsAt))
-    .map((event) => `#E${event.id} ${formatDateTime(event.startsAt)}\n${event.title}`)
+    .map((event) => `#E${event.id} ${formatEventTime(event)}\n${event.title}`)
     .join("\n\n");
 
   return `${title}\n\n${rows}`;
@@ -927,6 +951,23 @@ function formatDateTime(value) {
     minute: "2-digit",
     hour12: false
   }).format(new Date(value));
+}
+
+function formatDate(value) {
+  return new Intl.DateTimeFormat("zh-TW", {
+    timeZone: "Asia/Taipei",
+    year: "numeric",
+    month: "2-digit",
+    day: "2-digit"
+  }).format(new Date(value));
+}
+
+function formatEventTime(event) {
+  if (event.endsAt) {
+    return `${formatDate(event.startsAt)} - ${formatDate(event.endsAt)}`;
+  }
+
+  return formatDateTime(event.startsAt);
 }
 
 function taipeiDateParts(value) {
