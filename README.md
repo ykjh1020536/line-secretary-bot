@@ -1,86 +1,57 @@
-# LINE 秘書機器人
+# LINE Secretary Bot
 
-這是一個可以接到 LINE Messaging API 的小型秘書 Bot。它可以幫你把「跟某個人或客戶有關的事情」記錄起來，之後用 LINE 查詢或標記完成。
+生活用 LINE 秘書機器人，支援群組共用帳務與行程。
 
-## 功能
-
-- `欠A1000-300-20-30+300`：自動計算 950，記錄你欠A 950
-- `欠 A 飲料 80`：記錄你欠A飲料錢 80
-- `A 欠我 電影票 280`：記錄A欠你電影票 280
-- `A欠我500`：記錄A欠你 500
-- `分帳 1280 我 A B C`：你先付 1280，四人平均分帳
-- `還A300`：記錄你已還A 300
-- `A還我200`：記錄A已還你 200
-- `/欠`：列出雙方目前誰欠誰多少
-- `/欠 A`：只查A的帳務明細
-- `/欠明細`：列出最近欠款明細與時間
-- `/刪欠 D3`：刪除輸入錯誤的帳務
-- `/結清 A`：把你跟A目前的帳結清
-- `今天 15:30 拿包裹`：記錄今天 15:30 的行程
-- `明天 19:00 吃飯`：記錄明天 19:00 的行程
-- `8/10 19.看牙醫`：記錄 8/10 19:00 看牙醫
-- `2026/8/10 19:30 看牙醫`：記錄指定年份行程
-- `12/15-22 福岡`：記錄 12/15 到 12/22 的多日行程
-- `/行程`：列出全部行程
-- `/行程 今天`：只列出今天行程
-- `/行程 明天`：只列出明天行程
-- `/行程 本週`：只列出本週行程
-- `/行程 看牙醫`：用關鍵字查行程
-- `/刪行程 2`：刪除編號 2 的行程
-- `/改行程 E2 8/12 20:00 吃飯`：修改行程
-- `/完成行程 E2`：標記行程完成
-- `記 A 明天報價要回覆`：新增一筆事項
-- `查 A`：查某個對象的待辦
-- `全部`：列出所有未完成事項
-- `完成 3`：把編號 3 的事項標記完成
-- `說明`：顯示指令
-- `/說明`：顯示指令與可點的快速按鈕
-- `/`：顯示可點的快速按鈕
-
-## 本機啟動
-
-```bash
-npm install
-cp .env.example .env
-npm run dev
-```
-
-接著把 `.env` 裡的值改成你的 LINE Channel 資訊：
-
-```bash
-LINE_CHANNEL_ACCESS_TOKEN=你的 Channel access token
-LINE_CHANNEL_SECRET=你的 Channel secret
-PORT=3000
-DATA_FILE=./data/tasks.json
-SUPABASE_URL=你的 Supabase Project URL
-SUPABASE_SERVICE_ROLE_KEY=你的 Supabase service_role key
-SUPABASE_STORE_ID=line-secretary-bot
-```
-
-## LINE 後台設定
-
-1. 到 LINE Developers 建立 Provider 與 Messaging API Channel。
-2. 複製 `Channel secret` 到 `.env`。
-3. 發行 long-lived `Channel access token`，貼到 `.env`。
-4. 部署到 Render、Railway、Vercel 或其他 Node.js 主機。
-5. 在 LINE Developers 的 Webhook URL 填入：
+## 指令
 
 ```text
-https://你的網域/webhook
+/說明
+/
+
+欠 A 飲料 80
+欠@A 250
+@A 要給200
+A 要給我120
+@A 要給我120
+給@A 500
+我要給A300
+@A 已還800
+A已還700
+已還350
+欠A1000-300-20-30+300
+A 欠我 電影票 280
+還 A 300
+A 還我 200
+分帳 1280 我 A B C
+
+/欠
+/欠 A
+/欠明細
+/欠明細 A
+/改欠 D3 300
+/刪欠 D3
+/結清 A
+
+今天 15:30 拿包裹
+明天 19:00 吃飯
+8/10 19.看牙醫
+12/15-22 福岡
+
+/行程
+/行程 今天
+/行程 明天
+/行程 本週
+/行程 福岡
+/改行程 E2 8/12 20:00 吃飯
+/完成行程 E2
+/刪行程 E2
 ```
 
-6. 開啟 `Use webhook`。
-7. 掃描 Messaging API Channel 的 QR Code，把 Bot 加到 LINE。
+一般聊天不會回覆，避免太吵。
 
-## 部署提醒
+## Supabase
 
-正式部署建議使用 Supabase。Render 免費服務重新部署或休眠後，本機的 `data/tasks.json` 可能會消失；填好 Supabase 環境變數後，資料會存在 Supabase，不會因為更新程式被洗掉。
-
-群組裡的資料會共用：同一個 LINE 群組裡，不管誰輸入欠款或行程，大家查 `/欠`、`/行程` 都會看到同一份資料。私訊 Bot 則是個人資料。
-
-## Supabase 資料表
-
-到 Supabase 的 SQL Editor 執行一次：
+在 Supabase SQL Editor 執行：
 
 ```sql
 create table if not exists public.line_secretary_store (
@@ -88,62 +59,27 @@ create table if not exists public.line_secretary_store (
   data jsonb not null default '{}'::jsonb,
   updated_at timestamptz not null default now()
 );
+
+alter table public.line_secretary_store enable row level security;
+
+grant all on table public.line_secretary_store to service_role;
 ```
 
-然後到 Render 的 Environment Variables 新增：
+Render 環境變數新增：
 
 ```text
-SUPABASE_URL=你的 Supabase Project URL
-SUPABASE_SERVICE_ROLE_KEY=你的 Supabase service_role key
+SUPABASE_URL
+SUPABASE_SERVICE_ROLE_KEY
 SUPABASE_STORE_ID=line-secretary-bot
 ```
 
-`SUPABASE_STORE_ID` 可以維持預設；如果你未來開多個 Bot，才需要改成不同名字。
+`SUPABASE_SERVICE_ROLE_KEY` 只能放 Render 後端環境變數，不要放到前端或公開給別人。
 
-## 指令格式
+## Render
 
-| 目的 | 指令 | 範例 |
-| --- | --- | --- |
-| 記錄你欠對方 | `欠對象金額或算式` | `欠A1000-300-20-30+300` |
-| 記錄你欠對方並加備註 | `欠 對象 備註 金額` | `欠 A 飲料 80` |
-| 記錄對方欠你 | `對象欠我金額或算式` | `A欠我500` |
-| 記錄對方欠你並加備註 | `對象 欠我 備註 金額` | `A 欠我 電影票 280` |
-| 記錄你還對方 | `還對象金額` | `還A300` |
-| 記錄你還對方並加備註 | `還 對象 備註 金額` | `還 A 飲料 80` |
-| 記錄對方還你 | `對象還我金額` | `A還我200` |
-| 分帳 | `分帳 總金額 我 對象1 對象2` | `分帳 1280 我 A B C` |
-| 查欠款總表 | `/欠` | `/欠` |
-| 查單一對象 | `/欠 對象` | `/欠 A` |
-| 查欠款明細 | `/欠明細` | `/欠明細` |
-| 查單一對象明細 | `/欠明細 對象` | `/欠明細 A` |
-| 刪除錯帳 | `/刪欠 編號` | `/刪欠 D3` |
-| 結清某人 | `/結清 對象` | `/結清 A` |
-| 新增行程 | `日期 時間.事項` | `8/10 19.看牙醫` |
-| 新增多日行程 | `開始日期-結束日 事項` | `12/15-22 福岡` |
-| 新增今天行程 | `今天 時間 事項` | `今天 15:30 拿包裹` |
-| 新增明天行程 | `明天 時間 事項` | `明天 19:00 吃飯` |
-| 查全部行程 | `/行程` | `/行程` |
-| 查今天行程 | `/行程 今天` | `/行程 今天` |
-| 查明天行程 | `/行程 明天` | `/行程 明天` |
-| 查本週行程 | `/行程 本週` | `/行程 本週` |
-| 用關鍵字查行程 | `/行程 關鍵字` | `/行程 看牙醫` |
-| 修改行程 | `/改行程 編號 新時間 新事項` | `/改行程 E2 8/12 20:00 吃飯` |
-| 完成行程 | `/完成行程 編號` | `/完成行程 E2` |
-| 刪除行程 | `/刪行程 編號` | `/刪行程 2` |
-| 新增事項 | `記 對象 事項` | `記 A 明天報價要回覆` |
-| 查詢對象 | `查 對象` | `查 A` |
-| 全部待辦 | `全部` | `全部` |
-| 完成事項 | `完成 編號` | `完成 3` |
-| 看說明 | `說明` | `說明` |
-| 看快速選單 | `/` 或 `/說明` | `/` |
+```text
+Build Command: npm install
+Start Command: npm start
+```
 
-## LINE 快速選單
-
-LINE Messaging API 不能像 Discord 那樣在你「正在輸入 `/`」時即時跳出 autocomplete。不過這個 Bot 支援你送出 `/` 或 `/說明` 後，回覆一排可點的 quick reply 按鈕，例如：
-
-- `/欠`
-- `/欠明細`
-- `/行程`
-- `/行程 今天`
-- `欠 A 飲料 80`
-- `明天 19:00 吃飯`
+如果 Render 顯示 Supabase 無法存取 `line_secretary_store`，到 Supabase 的 Data API 設定確認這張表有開放給 API。

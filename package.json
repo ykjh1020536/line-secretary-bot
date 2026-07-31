@@ -1,19 +1,19 @@
 {
   "name": "line-secretary-bot",
   "version": "1.0.0",
-  "description": "A LINE secretary bot for recording follow-ups and notes by contact.",
+  "description": "A practical LINE secretary bot for shared debts, schedules, and reminders.",
   "main": "server.js",
   "scripts": {
     "start": "node server.js",
-    "dev": "node --watch server.js",
     "check": "node --check server.js"
   },
-  "engines": {
-    "node": ">=18"
-  },
   "dependencies": {
-    "@line/bot-sdk": "^9.5.0",
-    "dotenv": "^16.4.5",
-    "express": "^4.19.2"
+    "@line/bot-sdk": "11.2.0",
+    "@supabase/supabase-js": "2.110.8",
+    "dotenv": "16.6.1",
+    "express": "4.21.2"
+  },
+  "engines": {
+    "node": ">=22"
   }
 }
