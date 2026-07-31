@@ -12,6 +12,9 @@ const config = {
 
 const dataFile = path.resolve(process.env.DATA_FILE || "./data/tasks.json");
 const port = Number(process.env.PORT || 3000);
+const supabaseUrl = process.env.SUPABASE_URL ? process.env.SUPABASE_URL.replace(/\/$/, "") : "";
+const supabaseKey = process.env.SUPABASE_SERVICE_ROLE_KEY || process.env.SUPABASE_ANON_KEY || "";
+const supabaseStoreId = process.env.SUPABASE_STORE_ID || "line-secretary-bot";
 
 if (!config.channelAccessToken || !config.channelSecret) {
   console.warn("Missing LINE_CHANNEL_ACCESS_TOKEN or LINE_CHANNEL_SECRET in environment.");
@@ -41,7 +44,7 @@ async function handleEvent(event) {
   }
 
   const text = normalizeIncomingText(event.message.text);
-  const userId = event.source.userId || "unknown";
+  const userId = getConversationId(event.source);
   const reply = await runCommand(text, userId);
 
   if (!reply) {
@@ -155,6 +158,13 @@ function normalizeIncomingText(text) {
     .replace(/^／/, "/")
     .replace(/^\/\s+/, "/")
     .trim();
+}
+
+function getConversationId(source) {
+  if (source.groupId) return `group:${source.groupId}`;
+  if (source.roomId) return `room:${source.roomId}`;
+  if (source.userId) return `user:${source.userId}`;
+  return "unknown";
 }
 
 function toLineTextMessage(reply) {
@@ -899,18 +909,17 @@ function nextId(store) {
 }
 
 async function readStore() {
+  if (hasSupabaseStore()) {
+    return readSupabaseStore();
+  }
+
   try {
     const raw = await fs.readFile(dataFile, "utf8");
     const parsed = JSON.parse(raw);
-    return {
-      tasks: Array.isArray(parsed.tasks) ? parsed.tasks : [],
-      debts: Array.isArray(parsed.debts) ? parsed.debts : [],
-      events: Array.isArray(parsed.events) ? parsed.events : [],
-      splitBills: Array.isArray(parsed.splitBills) ? parsed.splitBills : []
-    };
+    return normalizeStore(parsed);
   } catch (error) {
     if (error.code === "ENOENT") {
-      return { tasks: [], debts: [], events: [], splitBills: [] };
+      return emptyStore();
     }
     throw error;
   }
@@ -1031,8 +1040,75 @@ function isInTaipeiWeek(eventValue, now) {
 }
 
 async function writeStore(store) {
+  if (hasSupabaseStore()) {
+    await writeSupabaseStore(store);
+    return;
+  }
+
   await fs.mkdir(path.dirname(dataFile), { recursive: true });
   await fs.writeFile(dataFile, JSON.stringify(store, null, 2));
+}
+
+function emptyStore() {
+  return { tasks: [], debts: [], events: [], splitBills: [] };
+}
+
+function normalizeStore(store) {
+  return {
+    tasks: Array.isArray(store.tasks) ? store.tasks : [],
+    debts: Array.isArray(store.debts) ? store.debts : [],
+    events: Array.isArray(store.events) ? store.events : [],
+    splitBills: Array.isArray(store.splitBills) ? store.splitBills : []
+  };
+}
+
+function hasSupabaseStore() {
+  return Boolean(supabaseUrl && supabaseKey);
+}
+
+async function readSupabaseStore() {
+  const url = `${supabaseUrl}/rest/v1/line_secretary_store?id=eq.${encodeURIComponent(supabaseStoreId)}&select=data`;
+  const response = await fetch(url, {
+    headers: supabaseHeaders()
+  });
+
+  if (!response.ok) {
+    throw new Error(`Supabase read failed: ${response.status} ${await response.text()}`);
+  }
+
+  const rows = await response.json();
+  if (!Array.isArray(rows) || rows.length === 0 || !rows[0].data) {
+    return emptyStore();
+  }
+
+  return normalizeStore(rows[0].data);
+}
+
+async function writeSupabaseStore(store) {
+  const response = await fetch(`${supabaseUrl}/rest/v1/line_secretary_store?on_conflict=id`, {
+    method: "POST",
+    headers: {
+      ...supabaseHeaders(),
+      "Content-Type": "application/json",
+      "Prefer": "resolution=merge-duplicates,return=minimal"
+    },
+    body: JSON.stringify({
+      id: supabaseStoreId,
+      data: normalizeStore(store),
+      updated_at: new Date().toISOString()
+    })
+  });
+
+  if (!response.ok) {
+    throw new Error(`Supabase write failed: ${response.status} ${await response.text()}`);
+  }
+}
+
+function supabaseHeaders() {
+  return {
+    apikey: supabaseKey,
+    Authorization: `Bearer ${supabaseKey}`
+  };
 }
 
 app.listen(port, () => {

@@ -52,6 +52,9 @@ LINE_CHANNEL_ACCESS_TOKEN=你的 Channel access token
 LINE_CHANNEL_SECRET=你的 Channel secret
 PORT=3000
 DATA_FILE=./data/tasks.json
+SUPABASE_URL=你的 Supabase Project URL
+SUPABASE_SERVICE_ROLE_KEY=你的 Supabase service_role key
+SUPABASE_STORE_ID=line-secretary-bot
 ```
 
 ## LINE 後台設定
@@ -71,7 +74,31 @@ https://你的網域/webhook
 
 ## 部署提醒
 
-目前資料存在 `data/tasks.json`，適合先測試。正式使用建議改成資料庫，例如 Supabase、Postgres 或 Google Sheet，避免平台重啟或重新部署時資料消失。
+正式部署建議使用 Supabase。Render 免費服務重新部署或休眠後，本機的 `data/tasks.json` 可能會消失；填好 Supabase 環境變數後，資料會存在 Supabase，不會因為更新程式被洗掉。
+
+群組裡的資料會共用：同一個 LINE 群組裡，不管誰輸入欠款或行程，大家查 `/欠`、`/行程` 都會看到同一份資料。私訊 Bot 則是個人資料。
+
+## Supabase 資料表
+
+到 Supabase 的 SQL Editor 執行一次：
+
+```sql
+create table if not exists public.line_secretary_store (
+  id text primary key,
+  data jsonb not null default '{}'::jsonb,
+  updated_at timestamptz not null default now()
+);
+```
+
+然後到 Render 的 Environment Variables 新增：
+
+```text
+SUPABASE_URL=你的 Supabase Project URL
+SUPABASE_SERVICE_ROLE_KEY=你的 Supabase service_role key
+SUPABASE_STORE_ID=line-secretary-bot
+```
+
+`SUPABASE_STORE_ID` 可以維持預設；如果你未來開多個 Bot，才需要改成不同名字。
 
 ## 指令格式
 
