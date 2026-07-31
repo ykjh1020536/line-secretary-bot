@@ -156,9 +156,12 @@ function commandName(text) {
 function safeEvalAmount(expr) {
   const clean = expr.replace(/,/g, "").trim();
   if (!/^[\d+\-*/().\s]+$/.test(clean)) return null;
+  if ((clean.match(/\d/g) || []).length > 9) return null;
   try {
     const value = Function(`"use strict"; return (${clean});`)();
-    return Number.isFinite(value) ? Math.round(value) : null;
+    if (!Number.isFinite(value)) return null;
+    const amount = Math.round(value);
+    return amount > 0 && amount <= 999999999 ? amount : null;
   } catch {
     return null;
   }
@@ -169,7 +172,7 @@ function formatMoney(n) {
 }
 
 function parseAmount(raw) {
-  const match = raw.match(/([\d,]+(?:\s*[+\-*/]\s*[\d,]+)*)/);
+  const match = raw.match(/^\s*([\d,]+(?:\s*[+\-*/]\s*[\d,]+)*)/);
   if (!match) return null;
   const amount = safeEvalAmount(match[1]);
   if (amount === null) return null;
@@ -210,53 +213,62 @@ function personUserId(scope, name) {
   return scope.people?.[name]?.userId || null;
 }
 
-function parseDebt(text) {
-  const input = normalizeInput(text);
+function inputWithMentionAliases(text, mention) {
+  let input = normalizeInput(text);
+  const targets = mentionTargets(text, mention).sort((a, b) => b.label.length - a.label.length);
+  for (const target of targets) {
+    input = input.split(target.label).join(`@${target.name}`);
+  }
+  return input;
+}
+
+function parseDebt(text, mention) {
+  const input = inputWithMentionAliases(text, mention);
   if (input.startsWith("分帳 ")) return parseSplit(input);
 
-  let m = input.match(/^欠\s*([^\s\d+\-*/]+)\s*(.*)$/);
+  let m = input.match(/^欠\s*(@?[^\s\d+\-*/]+)\s*(.*)$/);
   if (m) {
     const parsed = parseAmount(m[2]);
     if (parsed) return { type: "debt", person: cleanPersonName(m[1]), direction: "me_owe", ...parsed };
   }
 
-  m = input.match(/^我\s*(?:要給|給|還)\s*([^\s\d+\-*/]+)\s*(.*)$/);
+  m = input.match(/^我\s*(?:要給|給|還)\s*(@?[^\s\d+\-*/]+)\s*(.*)$/);
   if (m) {
     const parsed = parseAmount(m[2]);
     if (parsed) return { type: "payment", person: cleanPersonName(m[1]), direction: "paid_to_them", ...parsed };
   }
 
-  m = input.match(/^@?([^\s]+)\s*(?:要給我|要還我|要給|欠我)\s*(.*)$/);
+  m = input.match(/^(@?[^\s\d+\-*/]+)\s*(?:要給我|要還我|要給|欠我)\s*(.*)$/);
   if (m) {
     const parsed = parseAmount(m[2]);
     if (parsed) return { type: "debt", person: cleanPersonName(m[1]), direction: "they_owe", ...parsed };
   }
 
-  m = input.match(/^([^\s]+)\s*欠我\s*(.*)$/);
+  m = input.match(/^(@?[^\s\d+\-*/]+)\s*欠我\s*(.*)$/);
   if (m) {
     const parsed = parseAmount(m[2]);
     if (parsed) return { type: "debt", person: cleanPersonName(m[1]), direction: "they_owe", ...parsed };
   }
 
-  m = input.match(/^還\s*([^\s\d+\-*/]+)\s*(.*)$/);
+  m = input.match(/^還\s*(@?[^\s\d+\-*/]+)\s*(.*)$/);
   if (m) {
     const parsed = parseAmount(m[2]);
     if (parsed) return { type: "payment", person: cleanPersonName(m[1]), direction: "paid_to_them", ...parsed };
   }
 
-  m = input.match(/^給\s*([^\s\d+\-*/]+)\s*(.*)$/);
+  m = input.match(/^給\s*(@?[^\s\d+\-*/]+)\s*(.*)$/);
   if (m) {
     const parsed = parseAmount(m[2]);
     if (parsed) return { type: "payment", person: cleanPersonName(m[1]), direction: "paid_to_them", ...parsed };
   }
 
-  m = input.match(/^@?([^\s\d+\-*/]+)\s*已\s*還\s*(.*)$/);
+  m = input.match(/^(@?[^\s\d+\-*/]+)\s*已\s*還\s*(.*)$/);
   if (m) {
     const parsed = parseAmount(m[2]);
     if (parsed) return { type: "payment", person: cleanPersonName(m[1]), direction: "they_paid_me", ...parsed };
   }
 
-  m = input.match(/^([^\s]+)\s*還我\s*(.*)$/);
+  m = input.match(/^(@?[^\s\d+\-*/]+)\s*還我\s*(.*)$/);
   if (m) {
     const parsed = parseAmount(m[2]);
     if (parsed) return { type: "payment", person: cleanPersonName(m[1]), direction: "they_paid_me", ...parsed };
@@ -351,8 +363,8 @@ function debtDetails(scope, person) {
   return debtTextMessage(scope, rows.map((d) => `D${d.id} ${formatDebtLine(d, scope)}\n${formatDateTime(d.createdAt)}${d.note ? `\n註記：${d.note}` : ""}`).join("\n\n"));
 }
 
-function editDebt(scope, item, rest, targets = []) {
-  const parsedDebt = parseDebt(rest);
+function editDebt(scope, item, rest, mention = null, targets = []) {
+  const parsedDebt = parseDebt(rest, mention);
   if (parsedDebt && parsedDebt.type !== "split") {
     attachMention(scope, parsedDebt, targets);
     item.person = parsedDebt.person;
@@ -580,7 +592,7 @@ async function handleText(message, source) {
     const item = scope.debts.find((d) => String(d.id) === id && !d.deleted);
     if (!rawId || !rest) reply = "用法：/改欠 D3 300";
     else if (!item) reply = `找不到 D${id}`;
-    else if (!editDebt(scope, item, rest, targets)) reply = "改不了這筆，例：/改欠 D3 300";
+    else if (!editDebt(scope, item, rest, message.mention, targets)) reply = "改不了這筆，例：/改欠 D3 300";
     else {
       reply = debtTextMessage(scope, `已修改 D${item.id}\n${formatDebtLine(item, scope)}`);
       changed = true;
@@ -639,7 +651,7 @@ async function handleText(message, source) {
       changed = true;
     }
   } else {
-    const debt = parseDebt(input);
+    const debt = parseDebt(message.text, message.mention);
     if (debt) {
       attachMention(scope, debt, targets);
       reply = applyDebt(store, scope, debt, input);
