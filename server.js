@@ -77,6 +77,19 @@ function scopeId(source) {
 function getScope(store, id) {
   store.scopes[id] ||= { debts: [], events: [], tasks: [], people: {} };
   store.scopes[id].people ||= {};
+  store.scopes[id].events ||= [];
+  for (const event of store.scopes[id].events) {
+    event.reminders ||= [];
+    event.reminderOptOut ||= false;
+  }
+  return store.scopes[id];
+}
+
+function clearScope(store, id) {
+  store.scopes[id] = { debts: [], events: [], tasks: [], people: {}, actorName: null, actorUserId: null };
+  store.nextDebtId = 1;
+  store.nextEventId = 1;
+  store.nextTaskId = 1;
   return store.scopes[id];
 }
 
@@ -145,6 +158,23 @@ function taipeiToday() {
   return new Date(n.year, n.month - 1, n.day);
 }
 
+function taipeiNowDate() {
+  const n = nowParts();
+  return new Date(n.year, n.month - 1, n.day, n.hour, n.minute);
+}
+
+function parseTaipeiDateTime(value, fallbackHour = 9, fallbackMinute = 0) {
+  const [datePart, timePart] = value.split(" ");
+  const [year, month, day] = datePart.split("/").map(Number);
+  if (!timePart) return new Date(year, month - 1, day, fallbackHour, fallbackMinute);
+  const [hour, minute] = timePart.split(":").map(Number);
+  return new Date(year, month - 1, day, hour, minute || 0);
+}
+
+function dateTimeString(date) {
+  return `${date.getFullYear()}/${pad(date.getMonth() + 1)}/${pad(date.getDate())} ${pad(date.getHours())}:${pad(date.getMinutes())}`;
+}
+
 function normalizeInput(text) {
   return text.trim().replace(/^／/, "/").replace(/\s+/g, " ");
 }
@@ -156,7 +186,7 @@ function commandName(text) {
 function safeEvalAmount(expr) {
   const clean = expr.replace(/,/g, "").trim();
   if (!/^[\d+\-*/().\s]+$/.test(clean)) return null;
-  if ((clean.match(/\d/g) || []).length > 9) return null;
+  if ((clean.match(/\d+/g) || []).some((part) => part.length > 9)) return null;
   try {
     const value = Function(`"use strict"; return (${clean});`)();
     if (!Number.isFinite(value)) return null;
@@ -183,8 +213,8 @@ function amountErrorMessage(text, mention = null) {
   if (!/^\s*(?:欠|給|還|我\s*(?:要給|給|還)|@?\S+\s*(?:要給我|要還我|要給|欠我|已\s*還|還我)|已\s*還)/.test(inputWithMentionAliases(text, mention))) {
     return null;
   }
-  const digits = text.match(/\d/g) || [];
-  if (digits.length > 9) return "金額太大或格式異常，沒有記帳。請輸入 999,999,999 以下的金額。";
+  const numbers = text.match(/\d+/g) || [];
+  if (numbers.some((part) => part.length > 9)) return "金額太大或格式異常，沒有記帳。請輸入 999,999,999 以下的金額。";
   if (/\d/.test(text)) return "看起來像帳務，但金額格式讀不到。例：欠@A 100";
   return null;
 }
@@ -227,9 +257,9 @@ function inputWithMentionAliases(text, mention) {
   let input = normalizeInput(text);
   const targets = mentionTargets(text, mention).sort((a, b) => b.label.length - a.label.length);
   for (const target of targets) {
-    input = input.split(target.label).join(`@${target.name}`);
+    input = input.split(target.label).join(`@${target.name} `);
   }
-  return input;
+  return normalizeInput(input);
 }
 
 function parseDebt(text, mention) {
@@ -287,6 +317,24 @@ function parseDebt(text, mention) {
   return null;
 }
 
+function splitKnownPerson(scope, person, rest) {
+  const clean = cleanPersonName(person);
+  const names = Object.keys(scope.people || {}).sort((a, b) => b.length - a.length);
+  const hit = names.find((name) => clean.startsWith(name) && clean.length > name.length);
+  if (!hit) return { person: clean, rest };
+  return { person: hit, rest: `${clean.slice(hit.length)}${rest || ""}` };
+}
+
+function normalizeParsedDebtPerson(scope, parsed) {
+  if (!parsed || parsed.type === "split" || !parsed.person) return parsed;
+  if (personUserId(scope, parsed.person)) return parsed;
+  const split = splitKnownPerson(scope, parsed.person, parsed.note ? `${parsed.note}${parsed.expression}` : parsed.expression);
+  if (split.person === parsed.person) return parsed;
+  const reparsed = parseAmount(split.rest);
+  if (!reparsed) return parsed;
+  return { ...parsed, person: split.person, ...reparsed };
+}
+
 function parseBarePaid(text) {
   const m = normalizeInput(text).match(/^已\s*還\s*(.*)$/);
   if (!m) return null;
@@ -299,18 +347,15 @@ function parseSplit(input) {
   if (parts.length < 4) return null;
   const amount = safeEvalAmount(parts[1]);
   if (!amount) return null;
-  const people = parts.slice(2);
+  const people = [...new Set(parts.slice(2).map(cleanPersonName))];
   const share = Math.round(amount / people.length);
   return { type: "split", amount, people, share };
 }
 
 function applyDebt(store, scope, parsed, raw) {
-  const parsedUserId = parsed.mentionUserId || personUserId(scope, parsed.person);
-  if (parsed.person === scope.actorName || (parsedUserId && parsedUserId === scope.actorUserId)) {
-    return textMessage("這筆沒有記帳：不能記自己欠自己。請標記對方，例如：欠@A 100");
-  }
   if (parsed.type === "split") {
-    const others = parsed.people.filter((p) => p !== "我");
+    const others = parsed.people.filter((p) => p !== "我" && p !== scope.actorName && personUserId(scope, p) !== scope.actorUserId);
+    if (!others.length) return textMessage("這筆沒有分帳：名單裡只有自己。");
     const created = [];
     for (const person of others) {
       const item = newDebt(store, {
@@ -330,11 +375,22 @@ function applyDebt(store, scope, parsed, raw) {
     return debtTextMessage(scope, `已分帳\n總金額：${formatMoney(parsed.amount)}\n人數：${parsed.people.length}\n每人：${formatMoney(parsed.share)}\n已記錄：${others.map((p) => `${mentionToken(scope, p)} 欠${actorToken(scope)} ${formatMoney(parsed.share)}`).join("、")}`);
   }
 
+  const selfCheck = selfDebtReason(scope, parsed);
+  if (selfCheck) return textMessage(selfCheck);
+
   const item = newDebt(store, { ...parsed, raw, actorName: scope.actorName, actorUserId: scope.actorUserId });
   scope.debts.push(item);
   const offset = autoOffsetDebt(scope, item);
   const offsetText = offset ? `\n已自動抵消：${displayDebtRef(scope, offset)}` : "";
-  return debtTextMessage(scope, `已記錄 ${displayDebtRef(scope, item)}\n${formatDebtLine(item, scope)}\n時間：${formatDateTime(item.createdAt)}${offsetText}`);
+  return debtTextMessage(scope, `已記錄 ${displayDebtRef(scope, item)}\n${formatDebtLine(item, scope)}${item.note ? `\n備註：${item.note}` : ""}\n時間：${formatDateTime(item.createdAt)}${offsetText}`);
+}
+
+function selfDebtReason(scope, parsed) {
+  const parsedUserId = parsed.mentionUserId || personUserId(scope, parsed.person);
+  if (parsed.person === scope.actorName || (parsedUserId && parsedUserId === scope.actorUserId)) {
+    return "這筆沒有記帳：不能記自己欠自己。請標記對方，例如：欠@A 100";
+  }
+  return null;
 }
 
 function newDebt(store, fields) {
@@ -366,7 +422,8 @@ function debtSigned(item) {
 
 function debtSummary(scope, person) {
   reconcileOffsets(scope);
-  const rows = scope.debts.filter((d) => !d.deleted && !d.offsetBy && (!person || d.person === person));
+  const target = cleanPersonName(person || "");
+  const rows = scope.debts.filter((d) => !d.deleted && !d.offsetBy && (!target || d.person === target));
   const totals = new Map();
   for (const row of rows) {
     const actor = debtActorName(scope, row);
@@ -376,7 +433,7 @@ function debtSummary(scope, person) {
     totals.set(key, current);
   }
   const entries = [...totals.entries()].filter(([, entry]) => entry.value !== 0);
-  if (!entries.length) return textMessage(person ? `${person} 目前沒有欠款紀錄` : "目前沒有欠款");
+  if (!entries.length) return textMessage(target ? `${target} 目前沒有欠款紀錄` : "目前沒有欠款");
   return debtTextMessage(scope, entries
     .map(([, entry]) => {
       const actor = mentionToken(scope, entry.actor);
@@ -391,8 +448,9 @@ function debtSummary(scope, person) {
 
 function debtDetails(scope, person) {
   reconcileOffsets(scope);
-  const rows = scope.debts.filter((d) => !d.deleted && !d.offsetBy && (!person || d.person === person)).slice(-30);
-  if (!rows.length) return textMessage(person ? `${person} 沒有明細` : "目前沒有欠款明細");
+  const target = cleanPersonName(person || "");
+  const rows = scope.debts.filter((d) => !d.deleted && !d.offsetBy && (!target || d.person === target)).slice(-30);
+  if (!rows.length) return textMessage(target ? `${target} 沒有明細` : "目前沒有欠款明細");
   return debtTextMessage(scope, rows.map((d) => `${displayDebtRef(scope, d)}｜${formatDebtLine(d, scope)}${d.note ? `\n備註：${d.note}` : ""}\n時間：${formatDateTime(d.createdAt)}`).join("\n\n"));
 }
 
@@ -421,13 +479,24 @@ function findDebtByRef(scope, ref) {
 function editDebt(scope, item, rest, mention = null, targets = []) {
   const parsedDebt = parseDebt(rest, mention);
   if (parsedDebt && parsedDebt.type !== "split") {
-    attachMention(scope, parsedDebt, targets);
-    item.person = parsedDebt.person;
-    item.amount = parsedDebt.amount;
-    item.direction = parsedDebt.direction;
-    item.expression = parsedDebt.expression;
-    item.note = parsedDebt.note || item.note;
-    item.mentionUserId = parsedDebt.mentionUserId || personUserId(scope, parsedDebt.person);
+    const normalizedDebt = normalizeParsedDebtPerson(scope, parsedDebt);
+    attachMention(scope, normalizedDebt, targets);
+    const nextItem = {
+      ...item,
+      person: normalizedDebt.person,
+      amount: normalizedDebt.amount,
+      direction: normalizedDebt.direction,
+      expression: normalizedDebt.expression,
+      note: normalizedDebt.note || item.note,
+      mentionUserId: normalizedDebt.mentionUserId || personUserId(scope, normalizedDebt.person),
+    };
+    if (selfDebtReason(scope, nextItem)) return false;
+    item.person = normalizedDebt.person;
+    item.amount = normalizedDebt.amount;
+    item.direction = normalizedDebt.direction;
+    item.expression = normalizedDebt.expression;
+    item.note = normalizedDebt.note || item.note;
+    item.mentionUserId = normalizedDebt.mentionUserId || personUserId(scope, normalizedDebt.person);
     return true;
   }
 
@@ -459,15 +528,41 @@ function textMessage(text) {
   return { type: "text", text };
 }
 
+function reminderMessage(event, reminder) {
+  return {
+    type: "text",
+    text: `行程提醒\n${formatEvent(event)}\n提醒：${reminder.label}`,
+    quickReply: {
+      items: ["知道了", "10分鐘後", "1小時後", "今天晚上", "不再提醒"].map((label) => ({
+        type: "action",
+        action: { type: "message", label, text: label },
+      })),
+    },
+  };
+}
+
+function outboundMessage(message) {
+  if (!message || message.type !== "textV2") return message;
+  const { fallbackText: _fallbackText, ...clean } = message;
+  return clean;
+}
+
+function fallbackMessage(message) {
+  if (!message || message.type !== "textV2") return null;
+  return textMessage(message.fallbackText || message.text);
+}
+
 function debtTextMessage(scope, text) {
   const substitution = {};
+  let fallbackText = text;
   for (const [name, person] of Object.entries(scope.people || {})) {
     const key = personKey(name);
     if (!text.includes(`{${key}}`) || !person.userId) continue;
     substitution[key] = { type: "mention", mentionee: { type: "user", userId: person.userId } };
+    fallbackText = fallbackText.split(`{${key}}`).join(name);
   }
   if (!Object.keys(substitution).length) return textMessage(text);
-  return { type: "textV2", text, substitution };
+  return { type: "textV2", text, substitution, fallbackText };
 }
 
 function formatDebtLine(d, scope) {
@@ -545,7 +640,7 @@ function applyBarePaid(store, scope, parsed, raw) {
     scope.debts.push(item);
     const offset = autoOffsetDebt(scope, item);
     const offsetText = offset ? `\n已自動抵消：${displayDebtRef(scope, offset)}` : "";
-    return { changed: true, reply: debtTextMessage(scope, `已記錄 ${displayDebtRef(scope, item)}\n${formatDebtLine(item, scope)}\n時間：${formatDateTime(item.createdAt)}${offsetText}`) };
+    return { changed: true, reply: debtTextMessage(scope, `已記錄 ${displayDebtRef(scope, item)}\n${formatDebtLine(item, scope)}${item.note ? `\n備註：${item.note}` : ""}\n時間：${formatDateTime(item.createdAt)}${offsetText}`) };
   }
   if (!candidates.length) {
     return { changed: false, reply: `${scope.actorName || "你"}目前沒有欠別人的帳。請改成：已還@A 350` };
@@ -555,42 +650,83 @@ function applyBarePaid(store, scope, parsed, raw) {
 }
 
 function parseEvent(text) {
-  const input = normalizeInput(text);
+  const reminderConfig = parseReminderConfig(text);
+  const input = stripReminderConfig(normalizeInput(text));
   let m = input.match(/^(今天|明天|後天)\s+(\d{1,2})[:.：](\d{0,2})\s*(.+)$/);
   if (m) {
     const base = addDays(taipeiToday(), { 今天: 0, 明天: 1, 後天: 2 }[m[1]]);
-    return eventFromParts(base.getFullYear(), base.getMonth() + 1, base.getDate(), Number(m[2]), Number(m[3] || 0), m[4]);
+    return withReminderConfig(eventFromParts(base.getFullYear(), base.getMonth() + 1, base.getDate(), Number(m[2]), Number(m[3] || 0), m[4]), reminderConfig);
+  }
+
+  m = input.match(/^(今天|明天|後天)\s+(.+)$/);
+  if (m) {
+    const base = addDays(taipeiToday(), { 今天: 0, 明天: 1, 後天: 2 }[m[1]]);
+    return withReminderConfig({
+      start: dateOnly(base),
+      end: null,
+      title: m[2].trim(),
+      done: false,
+    }, reminderConfig);
   }
 
   m = input.match(/^(\d{1,2})\/(\d{1,2})-(\d{1,2})\s+(.+)$/);
   if (m) {
     const year = nowParts().year;
-    return {
+    return withReminderConfig({
       start: `${year}/${pad(m[1])}/${pad(m[2])}`,
       end: `${year}/${pad(m[1])}/${pad(m[3])}`,
       title: m[4].trim(),
       done: false,
-    };
+    }, reminderConfig);
   }
 
   m = input.match(/^(?:(\d{4})\/)?(\d{1,2})\/(\d{1,2})\s+(\d{1,2})[:.：](\d{0,2})\s*(.+)$/);
   if (m) {
     const year = Number(m[1] || nowParts().year);
-    return eventFromParts(year, Number(m[2]), Number(m[3]), Number(m[4]), Number(m[5] || 0), m[6]);
+    return withReminderConfig(eventFromParts(year, Number(m[2]), Number(m[3]), Number(m[4]), Number(m[5] || 0), m[6]), reminderConfig);
   }
 
   m = input.match(/^(?:(\d{4})\/)?(\d{1,2})\/(\d{1,2})\s+(.+)$/);
   if (m) {
     const year = Number(m[1] || nowParts().year);
-    return {
+    return withReminderConfig({
       start: `${year}/${pad(m[2])}/${pad(m[3])}`,
       end: null,
       title: m[4].trim(),
       done: false,
-    };
+    }, reminderConfig);
   }
 
   return null;
+}
+
+function parseReminderConfig(text) {
+  const input = normalizeInput(text);
+  if (/不提醒/.test(input)) return { mode: "none" };
+  let m = input.match(/提醒\s*(\d+)\s*分/);
+  if (m) return { mode: "before", minutes: Number(m[1]) };
+  m = input.match(/提醒\s*(\d+)\s*(?:小時|hr|h)/i);
+  if (m) return { mode: "before", minutes: Number(m[1]) * 60 };
+  if (/提醒前一天|前一天晚上提醒|前一天提醒/.test(input)) return { mode: "preset", preset: "day_before" };
+  if (/提醒當天早上|當天早上提醒/.test(input)) return { mode: "preset", preset: "morning" };
+  m = input.match(/提醒我?(?:早上|上午)?\s*(\d{1,2})[:.：點]?(\d{0,2})/);
+  if (m) return { mode: "clock", hour: Number(m[1]), minute: Number(m[2] || 0) };
+  return null;
+}
+
+function stripReminderConfig(text) {
+  return text
+    .replace(/\s*不提醒\s*$/, "")
+    .replace(/\s*提醒\s*\d+\s*分\s*$/, "")
+    .replace(/\s*提醒\s*\d+\s*(?:小時|hr|h)\s*$/i, "")
+    .replace(/\s*(?:提醒前一天|前一天晚上提醒|前一天提醒|提醒當天早上|當天早上提醒)\s*$/, "")
+    .replace(/\s*提醒我?(?:早上|上午)?\s*\d{1,2}[:.：點]?\d{0,2}\s*$/, "")
+    .trim();
+}
+
+function withReminderConfig(event, config) {
+  event.reminderConfig = config || null;
+  return event;
 }
 
 function eventFromParts(year, month, day, hour, minute, title) {
@@ -603,13 +739,17 @@ function eventFromParts(year, month, day, hour, minute, title) {
 }
 
 function applyEvent(store, scope, parsed) {
+  autoArchiveEvents(scope);
   const item = { id: `E${store.nextEventId++}`, ...parsed, createdAt: new Date().toISOString() };
+  item.reminders = buildReminders(item);
+  item.reminderOptOut = item.reminderConfig?.mode === "none";
   scope.events.push(item);
-  return `已記錄行程 ${displayEventRef(scope, item)}\n${formatEvent(item)}`;
+  return `已記錄行程 ${displayEventRef(scope, item)}\n${formatEvent(item)}\n提醒：${formatReminderSummary(item)}`;
 }
 
 function eventList(scope, filter) {
-  let events = scope.events.filter((e) => !e.deleted && !e.done);
+  autoArchiveEvents(scope);
+  let events = scope.events.filter((e) => !e.deleted && !e.done && !e.archived);
   const today = taipeiToday();
   const key = filter?.trim();
   if (key === "今天") events = events.filter((e) => e.start.startsWith(dateOnly(today)));
@@ -638,6 +778,68 @@ function eventList(scope, filter) {
   return events.slice(0, 30).map(formatEvent).join("\n\n");
 }
 
+function autoArchiveEvents(scope) {
+  const now = taipeiNowDate();
+  let changed = false;
+  for (const event of scope.events || []) {
+    if (event.deleted || event.done || event.archived) continue;
+    const end = event.end ? parseTaipeiDateTime(event.end, 23, 59) : parseTaipeiDateTime(event.start, event.start.includes(" ") ? 0 : 23, event.start.includes(" ") ? 0 : 59);
+    if (end < now) {
+      event.archived = true;
+      changed = true;
+    }
+  }
+  return changed;
+}
+
+function buildReminders(event) {
+  if (event.reminderConfig?.mode === "none") return [];
+  const start = parseTaipeiDateTime(event.start);
+  const hasTime = event.start.includes(" ");
+  const reminders = [];
+  const add = (date, label) => {
+    if (date >= taipeiNowDate()) reminders.push({ at: dateTimeString(date), label, sent: false });
+  };
+
+  if (event.reminderConfig?.mode === "before") {
+    add(new Date(start.getTime() - event.reminderConfig.minutes * 60000), `前 ${event.reminderConfig.minutes} 分鐘`);
+  } else if (event.reminderConfig?.mode === "clock") {
+    const date = new Date(start.getFullYear(), start.getMonth(), start.getDate(), event.reminderConfig.hour, event.reminderConfig.minute);
+    add(date, "指定時間");
+  } else if (event.reminderConfig?.preset === "day_before") {
+    add(new Date(start.getFullYear(), start.getMonth(), start.getDate() - 1, 21, 0), "前一天晚上");
+  } else if (event.reminderConfig?.preset === "morning") {
+    add(new Date(start.getFullYear(), start.getMonth(), start.getDate(), 9, 0), "當天早上");
+  } else {
+    const title = event.title;
+    if (/福岡|日本|旅行|旅遊|機票|出國|住宿/.test(title) || event.end) {
+      add(new Date(start.getFullYear(), start.getMonth(), start.getDate() - 7, 9, 0), "前 7 天");
+      add(new Date(start.getFullYear(), start.getMonth(), start.getDate() - 1, 21, 0), "前一天晚上");
+      add(new Date(start.getFullYear(), start.getMonth(), start.getDate(), 8, 0), "當天早上");
+    } else if (/牙醫|醫生|醫院|體檢|看診|回診|領藥/.test(title)) {
+      add(new Date(start.getFullYear(), start.getMonth(), start.getDate() - 1, 21, 0), "前一天晚上");
+      if (hasTime) add(new Date(start.getTime() - 120 * 60000), "前 2 小時");
+      else add(new Date(start.getFullYear(), start.getMonth(), start.getDate(), 9, 0), "當天早上");
+    } else if (/上班|開會|面試|考試|報告|交作業/.test(title)) {
+      add(new Date(start.getFullYear(), start.getMonth(), start.getDate() - 1, 22, 0), "前一天晚上");
+      add(new Date(start.getFullYear(), start.getMonth(), start.getDate(), 7, 0), "當天早上");
+    } else if (hasTime) {
+      add(new Date(start.getTime() - 120 * 60000), "前 2 小時");
+    } else {
+      add(new Date(start.getFullYear(), start.getMonth(), start.getDate(), 9, 0), "當天早上");
+    }
+  }
+
+  return reminders.sort((a, b) => a.at.localeCompare(b.at));
+}
+
+function formatReminderSummary(event) {
+  if (event.reminderOptOut || !event.reminders?.length) return "不提醒";
+  const pending = event.reminders.filter((r) => !r.sent);
+  if (!pending.length) return "已無待提醒";
+  return pending.map((r) => `${r.at} ${r.label}`).join("、");
+}
+
 function formatEvent(e) {
   const range = e.end ? `${formatEventDateTime(e.start)} - ${formatEventDateTime(e.end)}` : formatEventDateTime(e.start);
   return `${e.id}｜${range}\n${e.title}`;
@@ -653,6 +855,63 @@ function eventSortValue(event) {
 
 function formatEventDateTime(value) {
   return value.includes(" ") ? value : `${value} 全天`;
+}
+
+function reminderList(scope) {
+  autoArchiveEvents(scope);
+  ensureEventReminders(scope);
+  const events = scope.events.filter((e) => !e.deleted && !e.done && !e.archived);
+  const rows = events.filter((e) => e.reminders?.length || e.reminderOptOut);
+  if (!rows.length) return "目前沒有提醒";
+  return rows
+    .sort((a, b) => eventSortValue(a).localeCompare(eventSortValue(b)))
+    .map((e) => `${e.id}｜${e.title}\n${formatReminderSummary(e)}`)
+    .join("\n\n");
+}
+
+function ensureEventReminders(scope) {
+  let changed = false;
+  for (const event of scope.events || []) {
+    if (event.deleted || event.done || event.archived) continue;
+    if (!event.reminders || (!event.reminders.length && !event.reminderOptOut)) {
+      event.reminders = buildReminders(event);
+      event.reminderGenerated = true;
+      changed = true;
+    }
+  }
+  return changed;
+}
+
+function handleReminderAction(scope, input) {
+  if (!["知道了", "10分鐘後", "1小時後", "今天晚上", "不再提醒"].includes(input)) return null;
+  const event = scope.events.find((e) => e.id === scope.lastReminderEventId && !e.deleted && !e.done && !e.archived);
+  if (!event) return { changed: false, reply: "目前沒有可延後的提醒" };
+  if (input === "知道了") return { changed: false, reply: "好，已知道。" };
+  if (input === "不再提醒") {
+    event.reminderOptOut = true;
+    event.reminders = [];
+    return { changed: true, reply: `已關閉 ${event.id} 的提醒` };
+  }
+  const now = taipeiNowDate();
+  let at = null;
+  if (input === "10分鐘後") at = new Date(now.getTime() + 10 * 60000);
+  if (input === "1小時後") at = new Date(now.getTime() + 60 * 60000);
+  if (input === "今天晚上") at = new Date(now.getFullYear(), now.getMonth(), now.getDate(), 20, 0);
+  if (at <= now) at = new Date(now.getTime() + 10 * 60000);
+  event.reminderOptOut = false;
+  event.reminders ||= [];
+  event.reminders.push({ at: dateTimeString(at), label: input, sent: false });
+  event.reminders.sort((a, b) => a.at.localeCompare(b.at));
+  return { changed: true, reply: `已延後提醒：${dateTimeString(at)}` };
+}
+
+function updateEventReminder(event, rest) {
+  const config = parseReminderConfig(rest);
+  if (!config) return false;
+  event.reminderConfig = config;
+  event.reminderOptOut = config.mode === "none";
+  event.reminders = buildReminders(event);
+  return true;
 }
 
 function formatDateTime(iso) {
@@ -692,14 +951,18 @@ function helpMessage() {
       "/改欠 D3 300",
       "/刪欠 D3",
       "/結清 A",
+      "/全部清除",
       "",
       "行程",
       "今天 15:30 拿包裹",
       "明天 19:00 吃飯",
       "8/10 19.看牙醫",
       "12/15-22 福岡",
+      "8/10 19:00 看牙醫 提醒30分",
       "/行程",
       "/行程 今天",
+      "/提醒",
+      "/改提醒 E2 不提醒",
       "/改行程 E2 8/12 20:00 吃飯",
       "/刪行程 E2",
     ].join("\n"),
@@ -727,12 +990,24 @@ async function handleText(message, source) {
     return helpMessage();
   }
 
+  const reminderAction = handleReminderAction(scope, input);
+  if (reminderAction) {
+    if (reminderAction.changed) await saveStore(store);
+    return textMessage(reminderAction.reply);
+  }
+
+  if (input === "/全部清除") {
+    clearScope(store, scopeId(source));
+    await saveStore(store);
+    return textMessage("已清除這個聊天室的全部資料。");
+  }
+
   if (input.startsWith("/欠明細")) {
     reply = debtDetails(scope, input.replace("/欠明細", "").trim());
   } else if (input.startsWith("/欠")) {
     reply = debtSummary(scope, input.replace("/欠", "").trim());
   } else if (input.startsWith("/改欠")) {
-    const editMatch = input.match(/^\/改欠\s*(D?\d+)\s*(.+)$/i);
+    const editMatch = input.match(/^\/改欠\s*(#?D?\d+)\s*(.+)$/i);
     const rawId = editMatch?.[1];
     const rest = editMatch?.[2]?.trim() || "";
     const item = rawId ? findDebtByRef(scope, rawId) : null;
@@ -752,14 +1027,14 @@ async function handleText(message, source) {
       changed = true;
     }
   } else if (input.startsWith("/結清")) {
-    const person = input.replace("/結清", "").trim();
+    const person = cleanPersonName(input.replace("/結清", "").trim());
     const balance = scope.debts
       .filter((d) => !d.deleted && debtActorName(scope, d) === scope.actorName && d.person === person)
       .reduce((sum, d) => sum + debtSigned(d), 0);
     if (!person) reply = "用法：/結清 A";
     else if (balance === 0) reply = `${person} 已經是結清狀態`;
     else {
-      scope.debts.push(newDebt(store, {
+      const item = newDebt(store, {
         person,
         amount: Math.abs(balance),
         direction: balance > 0 ? "they_paid_me" : "paid_to_them",
@@ -767,8 +1042,24 @@ async function handleText(message, source) {
         raw: input,
         actorName: scope.actorName,
         actorUserId: scope.actorUserId,
-      }));
+      });
+      scope.debts.push(item);
+      reconcileOffsets(scope);
       reply = debtTextMessage(scope, `已結清 ${mentionToken(scope, person)}`);
+      changed = true;
+    }
+  } else if (input.startsWith("/提醒")) {
+    reply = reminderList(scope);
+  } else if (input.startsWith("/改提醒")) {
+    const m = input.match(/^\/改提醒\s*(E\d+)\s*(.+)$/i);
+    const id = m?.[1]?.toUpperCase();
+    const rest = m?.[2]?.trim() || "";
+    const item = scope.events.find((e) => e.id.toUpperCase() === id && !e.deleted);
+    if (!id || !rest) reply = "用法：/改提醒 E2 提醒30分";
+    else if (!item) reply = `找不到 ${id}`;
+    else if (!updateEventReminder(item, rest)) reply = "改不了提醒，例：/改提醒 E2 提醒30分";
+    else {
+      reply = `已修改提醒 ${item.id}\n${formatEvent(item)}\n提醒：${formatReminderSummary(item)}`;
       changed = true;
     }
   } else if (input.startsWith("/行程")) {
@@ -797,14 +1088,17 @@ async function handleText(message, source) {
     else if (!parsed) reply = "用法：/改行程 E2 8/12 20:00 吃飯";
     else {
       Object.assign(item, parsed);
+      item.reminders = buildReminders(item);
+      item.reminderOptOut = item.reminderConfig?.mode === "none";
       reply = `已修改 ${item.id}\n${formatEvent(item)}`;
       changed = true;
     }
   } else {
     const debt = parseDebt(message.text, message.mention);
     if (debt) {
-      attachMention(scope, debt, targets);
-      reply = applyDebt(store, scope, debt, input);
+      const normalizedDebt = normalizeParsedDebtPerson(scope, debt);
+      attachMention(scope, normalizedDebt, targets);
+      reply = applyDebt(store, scope, normalizedDebt, input);
       changed = true;
     } else {
       const barePaid = parseBarePaid(input);
@@ -826,6 +1120,20 @@ async function handleText(message, source) {
     }
   }
 
+  if (scope.events?.some((e) => e.archived && !e.archiveSaved)) {
+    for (const event of scope.events) {
+      if (event.archived) event.archiveSaved = true;
+    }
+    changed = true;
+  }
+
+  if (scope.events?.some((e) => e.reminderGenerated && !e.reminderSaved)) {
+    for (const event of scope.events) {
+      if (event.reminderGenerated) event.reminderSaved = true;
+    }
+    changed = true;
+  }
+
   if (changed) await saveStore(store);
   if (!reply) return null;
   return typeof reply === "string" ? textMessage(reply) : reply;
@@ -835,13 +1143,55 @@ app.get("/", (_req, res) => {
   res.send("LINE secretary bot is running.");
 });
 
+app.get("/reminders", async (_req, res) => {
+  try {
+    const store = await loadStore();
+    const now = dateTimeString(taipeiNowDate());
+    const pushes = [];
+    for (const [id, scope] of Object.entries(store.scopes || {})) {
+      if (id === "default") continue;
+      autoArchiveEvents(scope);
+      ensureEventReminders(scope);
+      for (const event of scope.events || []) {
+        if (event.deleted || event.done || event.archived || event.reminderOptOut) continue;
+        for (const reminder of event.reminders || []) {
+          if (reminder.sent || reminder.at > now) continue;
+          pushes.push({ to: id, event, reminder });
+          reminder.sent = true;
+          reminder.sentAt = now;
+          scope.lastReminderEventId = event.id;
+        }
+      }
+    }
+
+    for (const push of pushes) {
+      await client.pushMessage({
+        to: push.to,
+        messages: [reminderMessage(push.event, push.reminder)],
+      });
+    }
+
+    await saveStore(store);
+    res.json({ ok: true, sent: pushes.length });
+  } catch (error) {
+    console.error(error);
+    res.status(500).json({ ok: false, error: error.message });
+  }
+});
+
 app.post("/webhook", line.middleware(lineConfig), async (req, res) => {
   await Promise.all(
     req.body.events.map(async (event) => {
       if (event.type !== "message" || event.message.type !== "text") return;
       const reply = await handleText(event.message, event.source);
       if (!reply) return;
-      await client.replyMessage({ replyToken: event.replyToken, messages: [reply] });
+      try {
+        await client.replyMessage({ replyToken: event.replyToken, messages: [outboundMessage(reply)] });
+      } catch (error) {
+        const fallback = fallbackMessage(reply);
+        if (!fallback) throw error;
+        await client.replyMessage({ replyToken: event.replyToken, messages: [fallback] });
+      }
     })
   );
   res.status(200).end();
