@@ -40,7 +40,7 @@ async function handleEvent(event) {
     return;
   }
 
-  const text = event.message.text.trim();
+  const text = normalizeIncomingText(event.message.text);
   const userId = event.source.userId || "unknown";
   const reply = await runCommand(text, userId);
 
@@ -146,7 +146,15 @@ async function runCommand(text, userId) {
 }
 
 function isHelp(text) {
-  return /^(說明|\/說明|help|\/help|指令|\/指令)$/i.test(text);
+  return /^(?:\/)?(說明|help|指令)$/i.test(text);
+}
+
+function normalizeIncomingText(text) {
+  return text
+    .replace(/\u3000/g, " ")
+    .replace(/^／/, "/")
+    .replace(/^\/\s+/, "/")
+    .trim();
 }
 
 function toLineTextMessage(reply) {
