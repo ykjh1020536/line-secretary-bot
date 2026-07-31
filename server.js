@@ -172,11 +172,21 @@ function formatMoney(n) {
 }
 
 function parseAmount(raw) {
-  const match = raw.match(/^\s*([\d,]+(?:\s*[+\-*/]\s*[\d,]+)*)/);
+  const match = raw.match(/([\d,]+(?:\s*[+\-*/]\s*[\d,]+)*)/);
   if (!match) return null;
   const amount = safeEvalAmount(match[1]);
   if (amount === null) return null;
   return { amount, expression: match[1], note: raw.replace(match[1], "").trim() };
+}
+
+function amountErrorMessage(text, mention = null) {
+  if (!/^\s*(?:欠|給|還|我\s*(?:要給|給|還)|@?\S+\s*(?:要給我|要還我|要給|欠我|已\s*還|還我)|已\s*還)/.test(inputWithMentionAliases(text, mention))) {
+    return null;
+  }
+  const digits = text.match(/\d/g) || [];
+  if (digits.length > 9) return "金額太大或格式異常，沒有記帳。請輸入 999,999,999 以下的金額。";
+  if (/\d/.test(text)) return "看起來像帳務，但金額格式讀不到。例：欠@A 100";
+  return null;
 }
 
 function cleanPersonName(person) {
@@ -295,6 +305,10 @@ function parseSplit(input) {
 }
 
 function applyDebt(store, scope, parsed, raw) {
+  const parsedUserId = parsed.mentionUserId || personUserId(scope, parsed.person);
+  if (parsed.person === scope.actorName || (parsedUserId && parsedUserId === scope.actorUserId)) {
+    return textMessage("這筆沒有記帳：不能記自己欠自己。請標記對方，例如：欠@A 100");
+  }
   if (parsed.type === "split") {
     const others = parsed.people.filter((p) => p !== "我");
     const created = [];
@@ -307,6 +321,8 @@ function applyDebt(store, scope, parsed, raw) {
         expression: String(parsed.share),
         raw,
         mentionUserId: personUserId(scope, person),
+        actorName: scope.actorName,
+        actorUserId: scope.actorUserId,
       });
       scope.debts.push(item);
       created.push(item);
@@ -314,9 +330,11 @@ function applyDebt(store, scope, parsed, raw) {
     return debtTextMessage(scope, `已分帳\n總金額：${formatMoney(parsed.amount)}\n人數：${parsed.people.length}\n每人：${formatMoney(parsed.share)}\n已記錄：${others.map((p) => `${mentionToken(scope, p)} 欠${actorToken(scope)} ${formatMoney(parsed.share)}`).join("、")}`);
   }
 
-  const item = newDebt(store, { ...parsed, raw });
+  const item = newDebt(store, { ...parsed, raw, actorName: scope.actorName, actorUserId: scope.actorUserId });
   scope.debts.push(item);
-  return debtTextMessage(scope, `已記錄 D${item.id}\n${formatDebtLine(item, scope)}\n時間：${formatDateTime(item.createdAt)}`);
+  const offset = autoOffsetDebt(scope, item);
+  const offsetText = offset ? `\n已自動抵消：${displayDebtRef(scope, offset)}` : "";
+  return debtTextMessage(scope, `已記錄 ${displayDebtRef(scope, item)}\n${formatDebtLine(item, scope)}\n時間：${formatDateTime(item.createdAt)}${offsetText}`);
 }
 
 function newDebt(store, fields) {
@@ -329,12 +347,16 @@ function newDebt(store, fields) {
     expression: fields.expression || String(fields.amount),
     raw: fields.raw || "",
     mentionUserId: fields.mentionUserId || null,
+    actorName: fields.actorName || null,
+    actorUserId: fields.actorUserId || null,
+    offsetBy: null,
     createdAt: new Date().toISOString(),
     deleted: false,
   };
 }
 
 function debtSigned(item) {
+  if (item.offsetBy) return 0;
   if (item.direction === "they_owe") return item.amount;
   if (item.direction === "me_owe") return -item.amount;
   if (item.direction === "they_paid_me") return -item.amount;
@@ -343,24 +365,57 @@ function debtSigned(item) {
 }
 
 function debtSummary(scope, person) {
-  const rows = scope.debts.filter((d) => !d.deleted && (!person || d.person === person));
+  reconcileOffsets(scope);
+  const rows = scope.debts.filter((d) => !d.deleted && !d.offsetBy && (!person || d.person === person));
   const totals = new Map();
-  for (const row of rows) totals.set(row.person, (totals.get(row.person) || 0) + debtSigned(row));
-  if (!totals.size) return textMessage(person ? `${person} 目前沒有欠款紀錄` : "目前沒有欠款");
-  return debtTextMessage(scope, [...totals.entries()]
-    .map(([name, value]) => {
-      const token = mentionToken(scope, name);
-      if (value > 0) return `${token} 欠${actorToken(scope)} ${formatMoney(value)}`;
-      if (value < 0) return `${actorToken(scope)} 欠 ${token} ${formatMoney(Math.abs(value))}`;
-      return `${token} 已互相結清`;
+  for (const row of rows) {
+    const actor = debtActorName(scope, row);
+    const key = `${actor}\u0000${row.person}`;
+    const current = totals.get(key) || { actor, person: row.person, value: 0 };
+    current.value += debtSigned(row);
+    totals.set(key, current);
+  }
+  const entries = [...totals.entries()].filter(([, entry]) => entry.value !== 0);
+  if (!entries.length) return textMessage(person ? `${person} 目前沒有欠款紀錄` : "目前沒有欠款");
+  return debtTextMessage(scope, entries
+    .map(([, entry]) => {
+      const actor = mentionToken(scope, entry.actor);
+      const personToken = mentionToken(scope, entry.person);
+      if (entry.value > 0) return `${personToken} 欠 ${actor} ${formatMoney(entry.value)}`;
+      if (entry.value < 0) return `${actor} 欠 ${personToken} ${formatMoney(Math.abs(entry.value))}`;
+      return null;
     })
+    .filter(Boolean)
     .join("\n"));
 }
 
 function debtDetails(scope, person) {
-  const rows = scope.debts.filter((d) => !d.deleted && (!person || d.person === person)).slice(-30);
+  reconcileOffsets(scope);
+  const rows = scope.debts.filter((d) => !d.deleted && !d.offsetBy && (!person || d.person === person)).slice(-30);
   if (!rows.length) return textMessage(person ? `${person} 沒有明細` : "目前沒有欠款明細");
-  return debtTextMessage(scope, rows.map((d) => `D${d.id} ${formatDebtLine(d, scope)}\n${formatDateTime(d.createdAt)}${d.note ? `\n註記：${d.note}` : ""}`).join("\n\n"));
+  return debtTextMessage(scope, rows.map((d) => `${displayDebtRef(scope, d)}｜${formatDebtLine(d, scope)}${d.note ? `\n備註：${d.note}` : ""}\n時間：${formatDateTime(d.createdAt)}`).join("\n\n"));
+}
+
+function activeDebtRows(scope) {
+  reconcileOffsets(scope);
+  return scope.debts.filter((d) => !d.deleted && !d.offsetBy);
+}
+
+function displayDebtRef(scope, debt) {
+  const index = activeDebtRows(scope).findIndex((d) => d.id === debt.id);
+  return `#${index >= 0 ? index + 1 : debt.id}`;
+}
+
+function findDebtByRef(scope, ref) {
+  const raw = ref.trim();
+  const clean = raw.replace(/^D/i, "").replace(/^#/, "");
+  if (!clean) return null;
+  const active = activeDebtRows(scope);
+  if (!/^D/i.test(raw)) {
+    const byDisplay = active[Number(clean) - 1];
+    if (byDisplay) return byDisplay;
+  }
+  return scope.debts.find((d) => String(d.id) === clean && !d.deleted);
 }
 
 function editDebt(scope, item, rest, mention = null, targets = []) {
@@ -392,6 +447,10 @@ function actorToken(scope) {
   return mentionToken(scope, scope.actorName || "你");
 }
 
+function debtActorName(scope, debt) {
+  return debt.actorName || scope.actorName || "你";
+}
+
 function personKey(person) {
   return `u_${Buffer.from(person).toString("hex").slice(0, 18)}`;
 }
@@ -413,16 +472,64 @@ function debtTextMessage(scope, text) {
 
 function formatDebtLine(d, scope) {
   const person = mentionToken(scope, d.person);
-  const actor = actorToken(scope);
+  const actor = mentionToken(scope, debtActorName(scope, d));
   if (d.direction === "me_owe") return `${actor} 欠 ${person} ${formatMoney(d.amount)}`;
   if (d.direction === "they_owe") return `${person} 欠${actor} ${formatMoney(d.amount)}`;
   if (d.direction === "paid_to_them") return `${actor} 還 ${person} ${formatMoney(d.amount)}`;
   return `${person} 還${actor} ${formatMoney(d.amount)}`;
 }
 
+function oppositeDirections(a, b) {
+  return (
+    (a.direction === "me_owe" && b.direction === "they_paid_me") ||
+    (a.direction === "they_paid_me" && b.direction === "me_owe") ||
+    (a.direction === "they_owe" && b.direction === "paid_to_them") ||
+    (a.direction === "paid_to_them" && b.direction === "they_owe")
+  );
+}
+
+function autoOffsetDebt(scope, item) {
+  const match = scope.debts.find((d) =>
+    d.id !== item.id &&
+    !d.deleted &&
+    !d.offsetBy &&
+    debtActorName(scope, d) === debtActorName(scope, item) &&
+    d.person === item.person &&
+    d.amount === item.amount &&
+    oppositeDirections(d, item)
+  );
+  if (!match) return null;
+  match.offsetBy = item.id;
+  item.offsetBy = match.id;
+  return match;
+}
+
+function reconcileOffsets(scope) {
+  let changed = false;
+  const rows = scope.debts.filter((d) => !d.deleted && !d.offsetBy);
+  for (const item of rows) {
+    if (item.offsetBy) continue;
+    const match = scope.debts.find((d) =>
+      d.id !== item.id &&
+      !d.deleted &&
+      !d.offsetBy &&
+      debtActorName(scope, d) === debtActorName(scope, item) &&
+      d.person === item.person &&
+      d.amount === item.amount &&
+      oppositeDirections(d, item)
+    );
+    if (match) {
+      item.offsetBy = match.id;
+      match.offsetBy = item.id;
+      changed = true;
+    }
+  }
+  return changed;
+}
+
 function applyBarePaid(store, scope, parsed, raw) {
   const balances = new Map();
-  for (const debt of scope.debts.filter((d) => !d.deleted)) {
+  for (const debt of scope.debts.filter((d) => !d.deleted && debtActorName(scope, d) === scope.actorName)) {
     balances.set(debt.person, (balances.get(debt.person) || 0) + debtSigned(debt));
   }
   const candidates = [...balances.entries()].filter(([, balance]) => balance < 0);
@@ -432,9 +539,13 @@ function applyBarePaid(store, scope, parsed, raw) {
       person: candidates[0][0],
       direction: "paid_to_them",
       raw,
+      actorName: scope.actorName,
+      actorUserId: scope.actorUserId,
     });
     scope.debts.push(item);
-    return { changed: true, reply: debtTextMessage(scope, `已記錄 D${item.id}\n${formatDebtLine(item, scope)}\n時間：${formatDateTime(item.createdAt)}`) };
+    const offset = autoOffsetDebt(scope, item);
+    const offsetText = offset ? `\n已自動抵消：${displayDebtRef(scope, offset)}` : "";
+    return { changed: true, reply: debtTextMessage(scope, `已記錄 ${displayDebtRef(scope, item)}\n${formatDebtLine(item, scope)}\n時間：${formatDateTime(item.createdAt)}${offsetText}`) };
   }
   if (!candidates.length) {
     return { changed: false, reply: `${scope.actorName || "你"}目前沒有欠別人的帳。請改成：已還@A 350` };
@@ -468,6 +579,17 @@ function parseEvent(text) {
     return eventFromParts(year, Number(m[2]), Number(m[3]), Number(m[4]), Number(m[5] || 0), m[6]);
   }
 
+  m = input.match(/^(?:(\d{4})\/)?(\d{1,2})\/(\d{1,2})\s+(.+)$/);
+  if (m) {
+    const year = Number(m[1] || nowParts().year);
+    return {
+      start: `${year}/${pad(m[2])}/${pad(m[3])}`,
+      end: null,
+      title: m[4].trim(),
+      done: false,
+    };
+  }
+
   return null;
 }
 
@@ -483,7 +605,7 @@ function eventFromParts(year, month, day, hour, minute, title) {
 function applyEvent(store, scope, parsed) {
   const item = { id: `E${store.nextEventId++}`, ...parsed, createdAt: new Date().toISOString() };
   scope.events.push(item);
-  return `已記錄行程 ${item.id}\n${formatEvent(item)}`;
+  return `已記錄行程 ${displayEventRef(scope, item)}\n${formatEvent(item)}`;
 }
 
 function eventList(scope, filter) {
@@ -495,17 +617,42 @@ function eventList(scope, filter) {
   else if (key === "本週") {
     const end = addDays(today, 7);
     events = events.filter((e) => new Date(e.start.replace(/\//g, "-")) <= end);
+  } else if (key && /^\d{1,2}\/\d{1,2}/.test(key)) {
+    const m = key.match(/^(\d{1,2})\/(\d{1,2})(?:\s+(.+))?/);
+    const year = nowParts().year;
+    const day = `${year}/${pad(m[1])}/${pad(m[2])}`;
+    const keyword = (m[3] || "").trim();
+    events = events.filter((e) => e.start.startsWith(day) && (!keyword || e.title.includes(keyword)));
+    if (!events.length && keyword) {
+      const sameDayEvents = scope.events.filter((e) => !e.deleted && !e.done && e.start.startsWith(day));
+      if (sameDayEvents.length) {
+        sameDayEvents.sort((a, b) => eventSortValue(a).localeCompare(eventSortValue(b)) || String(a.id).localeCompare(String(b.id)));
+        return `8/${Number(m[2])} 沒有「${keyword}」\n\n當天有：\n${sameDayEvents.slice(0, 10).map(formatEvent).join("\n\n")}`;
+      }
+    }
   } else if (key) {
     events = events.filter((e) => e.title.includes(key));
   }
-  events.sort((a, b) => a.start.localeCompare(b.start));
+  events.sort((a, b) => eventSortValue(a).localeCompare(eventSortValue(b)) || String(a.id).localeCompare(String(b.id)));
   if (!events.length) return key ? `${key} 沒有行程` : "目前沒有行程";
   return events.slice(0, 30).map(formatEvent).join("\n\n");
 }
 
 function formatEvent(e) {
-  const range = e.end ? `${e.start} - ${e.end}` : e.start;
-  return `${e.id} ${range}\n${e.title}`;
+  const range = e.end ? `${formatEventDateTime(e.start)} - ${formatEventDateTime(e.end)}` : formatEventDateTime(e.start);
+  return `${e.id}｜${range}\n${e.title}`;
+}
+
+function displayEventRef(_scope, event) {
+  return event.id;
+}
+
+function eventSortValue(event) {
+  return event.start.includes(" ") ? event.start : `${event.start} 99:99`;
+}
+
+function formatEventDateTime(value) {
+  return value.includes(" ") ? value : `${value} 全天`;
 }
 
 function formatDateTime(iso) {
@@ -588,26 +735,27 @@ async function handleText(message, source) {
     const editMatch = input.match(/^\/改欠\s*(D?\d+)\s*(.+)$/i);
     const rawId = editMatch?.[1];
     const rest = editMatch?.[2]?.trim() || "";
-    const id = (rawId || "").replace(/^D/i, "");
-    const item = scope.debts.find((d) => String(d.id) === id && !d.deleted);
+    const item = rawId ? findDebtByRef(scope, rawId) : null;
     if (!rawId || !rest) reply = "用法：/改欠 D3 300";
-    else if (!item) reply = `找不到 D${id}`;
+    else if (!item) reply = `找不到 ${rawId}`;
     else if (!editDebt(scope, item, rest, message.mention, targets)) reply = "改不了這筆，例：/改欠 D3 300";
     else {
-      reply = debtTextMessage(scope, `已修改 D${item.id}\n${formatDebtLine(item, scope)}`);
+      reply = debtTextMessage(scope, `已修改 ${displayDebtRef(scope, item)}\n${formatDebtLine(item, scope)}`);
       changed = true;
     }
   } else if (input.startsWith("/刪欠")) {
-    const id = input.replace("/刪欠", "").trim().replace(/^D/i, "");
-    const item = scope.debts.find((d) => String(d.id) === id && !d.deleted);
-    reply = item ? `已刪除 D${item.id}` : `找不到 D${id}`;
+    const ref = input.replace("/刪欠", "").trim();
+    const item = findDebtByRef(scope, ref);
+    reply = item ? `已刪除 ${displayDebtRef(scope, item)}` : `找不到 ${ref}`;
     if (item) {
       item.deleted = true;
       changed = true;
     }
   } else if (input.startsWith("/結清")) {
     const person = input.replace("/結清", "").trim();
-    const balance = scope.debts.filter((d) => !d.deleted && d.person === person).reduce((sum, d) => sum + debtSigned(d), 0);
+    const balance = scope.debts
+      .filter((d) => !d.deleted && debtActorName(scope, d) === scope.actorName && d.person === person)
+      .reduce((sum, d) => sum + debtSigned(d), 0);
     if (!person) reply = "用法：/結清 A";
     else if (balance === 0) reply = `${person} 已經是結清狀態`;
     else {
@@ -617,6 +765,8 @@ async function handleText(message, source) {
         direction: balance > 0 ? "they_paid_me" : "paid_to_them",
         note: "結清",
         raw: input,
+        actorName: scope.actorName,
+        actorUserId: scope.actorUserId,
       }));
       reply = debtTextMessage(scope, `已結清 ${mentionToken(scope, person)}`);
       changed = true;
@@ -662,6 +812,10 @@ async function handleText(message, source) {
         const result = applyBarePaid(store, scope, barePaid, input);
         reply = result.reply;
         changed = result.changed;
+      }
+
+      if (!reply) {
+        reply = amountErrorMessage(message.text, message.mention);
       }
 
       const event = reply ? null : parseEvent(input);
