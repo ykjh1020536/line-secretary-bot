@@ -10,6 +10,7 @@ const PORT = process.env.PORT || 3000;
 const DATA_FILE = path.join(__dirname, "data", "tasks.json");
 const STORE_ID = process.env.SUPABASE_STORE_ID || "line-secretary-bot";
 const TZ = "Asia/Taipei";
+const ARCHIVE_GRACE_MINUTES = 30;
 
 const lineConfig = {
   channelAccessToken: process.env.LINE_CHANNEL_ACCESS_TOKEN,
@@ -348,22 +349,23 @@ function parseSplit(input) {
   const amount = safeEvalAmount(parts[1]);
   if (!amount) return null;
   const people = [...new Set(parts.slice(2).map(cleanPersonName))];
-  const share = Math.round(amount / people.length);
-  return { type: "split", amount, people, share };
+  return { type: "split", amount, people };
 }
 
 function applyDebt(store, scope, parsed, raw) {
   if (parsed.type === "split") {
     const others = parsed.people.filter((p) => p !== "我" && p !== scope.actorName && personUserId(scope, p) !== scope.actorUserId);
     if (!others.length) return textMessage("這筆沒有分帳：名單裡只有自己。");
+    const participants = ["我", ...others];
+    const share = Math.round(parsed.amount / participants.length);
     const created = [];
     for (const person of others) {
       const item = newDebt(store, {
         person,
-        amount: parsed.share,
+        amount: share,
         direction: "they_owe",
         note: `分帳 ${formatMoney(parsed.amount)}`,
-        expression: String(parsed.share),
+        expression: String(share),
         raw,
         mentionUserId: personUserId(scope, person),
         actorName: scope.actorName,
@@ -372,7 +374,14 @@ function applyDebt(store, scope, parsed, raw) {
       scope.debts.push(item);
       created.push(item);
     }
-    return debtTextMessage(scope, `已分帳\n總金額：${formatMoney(parsed.amount)}\n人數：${parsed.people.length}\n每人：${formatMoney(parsed.share)}\n已記錄：${others.map((p) => `${mentionToken(scope, p)} 欠${actorToken(scope)} ${formatMoney(parsed.share)}`).join("、")}`);
+    return debtTextMessage(scope, [
+      "已分帳",
+      `總金額：${formatMoney(parsed.amount)}`,
+      `分帳人數：${participants.length}（含付款人）`,
+      `每人：${formatMoney(share)}`,
+      "",
+      ...others.map((p) => `${mentionToken(scope, p)} 欠 ${actorToken(scope)} ${formatMoney(share)}`),
+    ].join("\n"));
   }
 
   const selfCheck = selfDebtReason(scope, parsed);
@@ -649,7 +658,7 @@ function applyBarePaid(store, scope, parsed, raw) {
   return { changed: false, reply: `請補人名，避免記錯。\n例：已還@A ${formatMoney(parsed.amount)}\n\n目前${scope.actorName || "你"}欠：\n${list}` };
 }
 
-function parseEvent(text) {
+function parseEvent(text, options = {}) {
   const reminderConfig = parseReminderConfig(text);
   const input = stripReminderConfig(normalizeInput(text));
   let m = input.match(/^(今天|明天|後天)\s+(\d{1,2})[:.：](\d{0,2})\s*(.+)$/);
@@ -680,10 +689,11 @@ function parseEvent(text) {
     }, reminderConfig);
   }
 
-  m = input.match(/^(?:(\d{4})\/)?(\d{1,2})\/(\d{1,2})\s+(\d{1,2})[:.：](\d{0,2})\s*(.+)$/);
+  m = input.match(/^(?:(\d{4})\/)?(\d{1,2})\/(\d{1,2})\s+(\d{1,2})[:.：](\d{1,2})(?:\s+(.+))?$/);
   if (m) {
+    if (!m[6] && !options.allowMissingTitle) return null;
     const year = Number(m[1] || nowParts().year);
-    return withReminderConfig(eventFromParts(year, Number(m[2]), Number(m[3]), Number(m[4]), Number(m[5] || 0), m[6]), reminderConfig);
+    return withReminderConfig(eventFromParts(year, Number(m[2]), Number(m[3]), Number(m[4]), Number(m[5]), m[6] || ""), reminderConfig);
   }
 
   m = input.match(/^(?:(\d{4})\/)?(\d{1,2})\/(\d{1,2})\s+(.+)$/);
@@ -784,7 +794,8 @@ function autoArchiveEvents(scope) {
   for (const event of scope.events || []) {
     if (event.deleted || event.done || event.archived) continue;
     const end = event.end ? parseTaipeiDateTime(event.end, 23, 59) : parseTaipeiDateTime(event.start, event.start.includes(" ") ? 0 : 23, event.start.includes(" ") ? 0 : 59);
-    if (end < now) {
+    const archiveAfter = new Date(end.getTime() + ARCHIVE_GRACE_MINUTES * 60000);
+    if (archiveAfter < now) {
       event.archived = true;
       changed = true;
     }
@@ -1083,10 +1094,11 @@ async function handleText(message, source) {
   } else if (input.startsWith("/改行程")) {
     const [, id, ...rest] = input.split(" ");
     const item = scope.events.find((e) => e.id.toUpperCase() === (id || "").toUpperCase() && !e.deleted);
-    const parsed = parseEvent(rest.join(" "));
+    const parsed = parseEvent(rest.join(" "), { allowMissingTitle: true });
     if (!item) reply = `找不到 ${id || ""}`;
     else if (!parsed) reply = "用法：/改行程 E2 8/12 20:00 吃飯";
     else {
+      if (!parsed.title) parsed.title = item.title;
       Object.assign(item, parsed);
       item.reminders = buildReminders(item);
       item.reminderOptOut = item.reminderConfig?.mode === "none";
@@ -1148,31 +1160,38 @@ app.get("/reminders", async (_req, res) => {
     const store = await loadStore();
     const now = dateTimeString(taipeiNowDate());
     const pushes = [];
+    const stats = { scopes: 0, events: 0, reminders: 0, due: 0, archived: 0 };
     for (const [id, scope] of Object.entries(store.scopes || {})) {
       if (id === "default") continue;
-      autoArchiveEvents(scope);
+      stats.scopes += 1;
       ensureEventReminders(scope);
       for (const event of scope.events || []) {
+        if (!event.deleted && !event.done && !event.archived) stats.events += 1;
         if (event.deleted || event.done || event.archived || event.reminderOptOut) continue;
         for (const reminder of event.reminders || []) {
+          if (!reminder.sent) stats.reminders += 1;
           if (reminder.sent || reminder.at > now) continue;
-          pushes.push({ to: id, event, reminder });
-          reminder.sent = true;
-          reminder.sentAt = now;
-          scope.lastReminderEventId = event.id;
+          stats.due += 1;
+          pushes.push({ to: id, scope, event, reminder });
         }
       }
+      if (autoArchiveEvents(scope)) stats.archived += 1;
     }
 
+    let sent = 0;
     for (const push of pushes) {
       await client.pushMessage({
         to: push.to,
         messages: [reminderMessage(push.event, push.reminder)],
       });
+      push.reminder.sent = true;
+      push.reminder.sentAt = now;
+      push.scope.lastReminderEventId = push.event.id;
+      sent += 1;
     }
 
     await saveStore(store);
-    res.json({ ok: true, sent: pushes.length });
+    res.json({ ok: true, now, sent, ...stats });
   } catch (error) {
     console.error(error);
     res.status(500).json({ ok: false, error: error.message });
