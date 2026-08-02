@@ -211,13 +211,19 @@ function parseAmount(raw) {
 }
 
 function amountErrorMessage(text, mention = null) {
-  if (!/^\s*(?:欠|給|還|我\s*(?:要給|給|還)|@?\S+\s*(?:要給我|要還我|要給|欠我|已\s*還|還我)|已\s*還)/.test(inputWithMentionAliases(text, mention))) {
+  const input = inputWithMentionAliases(text, mention);
+  if (isCountdownText(input)) return null;
+  if (!/^\s*(?:欠|給|還|我\s*(?:要給|給|還)|@?\S+\s*(?:要給我|要還我|要給|欠我|已\s*還|還我)|已\s*還)/.test(input)) {
     return null;
   }
   const numbers = text.match(/\d+/g) || [];
   if (numbers.some((part) => part.length > 9)) return "金額太大或格式異常，沒有記帳。請輸入 999,999,999 以下的金額。";
   if (/\d/.test(text)) return "看起來像帳務，但金額格式讀不到。例：欠@A 100";
   return null;
+}
+
+function isCountdownText(text) {
+  return /^還有\s*[0-9零〇一二兩三四五六七八九十百半]+\s*(?:分|分鐘|小時|時|天|日|週|星期|個月)/.test(normalizeInput(text));
 }
 
 function cleanPersonName(person) {
@@ -274,6 +280,7 @@ function inputWithMentionAliases(text, mention) {
 
 function parseDebt(text, mention) {
   const input = inputWithMentionAliases(text, mention);
+  if (isCountdownText(input)) return null;
   if (input.startsWith("分帳 ")) return parseSplit(input);
 
   let m = input.match(/^欠\s*(@?[^\s\d+\-*/]+)\s*(.*)$/);
