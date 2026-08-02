@@ -793,22 +793,35 @@ function eventFromParts(year, month, day, hour, minute, title) {
   };
 }
 
+function activeEventCount(scope) {
+  const todayText = dateOnly(taipeiToday());
+  return (scope.events || []).filter((e) => !e.deleted && !e.done && (!e.archived || e.start.startsWith(todayText))).length;
+}
+
 function applyEvent(store, scope, parsed) {
   autoArchiveEvents(scope);
   const item = { id: `E${store.nextEventId++}`, ...parsed, createdAt: new Date().toISOString() };
   item.reminders = buildReminders(item);
   item.reminderOptOut = item.reminderConfig?.mode === "none";
   scope.events.push(item);
-  return `已記錄行程 ${displayEventRef(scope, item)}\n${formatEvent(item)}\n提醒：${formatReminderSummary(item)}`;
+  return [
+    `已記錄行程 ${displayEventRef(scope, item)}`,
+    formatEvent(item),
+    `提醒：${formatReminderSummary(item)}`,
+    `目前行程數：${activeEventCount(scope)}`,
+  ].filter(Boolean).join("\n");
 }
 
 function eventList(scope, filter) {
   autoArchiveEvents(scope);
-  let events = scope.events.filter((e) => !e.deleted && !e.done && !e.archived);
+  const todayText = dateOnly(taipeiToday());
+  let events = scope.events.filter((e) => !e.deleted && !e.done && (!e.archived || e.start.startsWith(todayText)));
+  const total = events.length;
   const today = taipeiToday();
   const key = filter?.trim();
   if (key === "今天") events = events.filter((e) => e.start.startsWith(dateOnly(today)));
   else if (key === "明天") events = events.filter((e) => e.start.startsWith(dateOnly(addDays(today, 1))));
+  else if (key === "已過" || key === "過期") events = scope.events.filter((e) => !e.deleted && !e.done && e.archived).slice(-30);
   else if (key === "本週") {
     const end = addDays(today, 7);
     events = events.filter((e) => new Date(e.start.replace(/\//g, "-")) <= end);
@@ -829,8 +842,9 @@ function eventList(scope, filter) {
     events = events.filter((e) => e.title.includes(key));
   }
   events.sort((a, b) => eventSortValue(a).localeCompare(eventSortValue(b)) || String(a.id).localeCompare(String(b.id)));
-  if (!events.length) return key ? `${key} 沒有行程` : "目前沒有行程";
-  return events.slice(0, 30).map(formatEvent).join("\n\n");
+  const meta = `目前行程數：${total}`;
+  if (!events.length) return `${key ? `${key} 沒有行程` : "目前沒有行程"}\n${meta}`;
+  return `${events.slice(0, 30).map(formatEvent).join("\n\n")}\n\n${meta}`;
 }
 
 function autoArchiveEvents(scope) {
@@ -1034,8 +1048,9 @@ function helpMessage() {
 async function handleText(message, source) {
   const input = commandName(message.text);
   const targets = mentionTargets(message.text, message.mention);
+  const currentScopeId = scopeId(source);
   const store = await loadStore();
-  const scope = getScope(store, scopeId(source));
+  const scope = getScope(store, currentScopeId);
   updateActor(scope, source);
   await hydrateActorName(scope, source);
 
@@ -1053,7 +1068,7 @@ async function handleText(message, source) {
   }
 
   if (input === "/全部清除") {
-    clearScope(store, scopeId(source));
+    clearScope(store, currentScopeId);
     await saveStore(store);
     return textMessage("已清除這個聊天室的全部資料。");
   }
