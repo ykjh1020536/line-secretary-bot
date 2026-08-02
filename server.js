@@ -221,7 +221,13 @@ function amountErrorMessage(text, mention = null) {
 }
 
 function cleanPersonName(person) {
-  return person.trim().replace(/^@+/, "");
+  return String(person || "").trim().replace(/^@+/, "");
+}
+
+function partyNameKey(person) {
+  return cleanPersonName(person)
+    .replace(/[\s\u00a0\u200b-\u200f\u202a-\u202e]/g, "")
+    .toLowerCase();
 }
 
 function mentionTargets(text, mention) {
@@ -251,7 +257,10 @@ function attachMention(scope, parsed, targets) {
 }
 
 function personUserId(scope, name) {
-  return scope.people?.[name]?.userId || null;
+  if (scope.people?.[name]?.userId) return scope.people[name].userId;
+  const key = partyNameKey(name);
+  const hit = Object.entries(scope.people || {}).find(([person]) => partyNameKey(person) === key);
+  return hit?.[1]?.userId || null;
 }
 
 function inputWithMentionAliases(text, mention) {
@@ -444,8 +453,8 @@ function debtSummary(scope, person) {
     const actor = debtActorName(scope, row);
     const actorUserId = row.actorUserId || personUserId(scope, actor) || "";
     const personUserIdValue = row.mentionUserId || personUserId(scope, row.person) || "";
-    const actorKey = actorUserId || actor;
-    const personKeyValue = personUserIdValue || row.person;
+    const actorKey = actorUserId || partyNameKey(actor);
+    const personKeyValue = personUserIdValue || partyNameKey(row.person);
     const key = `${actorKey}\u0000${personKeyValue}`;
     const current = totals.get(key) || { actor, actorUserId, person: row.person, personUserId: personUserIdValue, value: 0 };
     if (!current.actorUserId && actorUserId) current.actorUserId = actorUserId;
