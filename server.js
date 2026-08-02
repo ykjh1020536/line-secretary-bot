@@ -710,13 +710,28 @@ function parseEvent(text, options = {}) {
   return null;
 }
 
+function parseChineseNumber(value) {
+  if (!value) return null;
+  if (/^\d+$/.test(value)) return Number(value);
+  const digits = { 零: 0, 〇: 0, 一: 1, 二: 2, 兩: 2, 三: 3, 四: 4, 五: 5, 六: 6, 七: 7, 八: 8, 九: 9 };
+  if (value === "十") return 10;
+  let m = value.match(/^十([一二兩三四五六七八九])$/);
+  if (m) return 10 + digits[m[1]];
+  m = value.match(/^([一二兩三四五六七八九])十$/);
+  if (m) return digits[m[1]] * 10;
+  m = value.match(/^([一二兩三四五六七八九])十([一二兩三四五六七八九])$/);
+  if (m) return digits[m[1]] * 10 + digits[m[2]];
+  if (value.length === 1 && value in digits) return digits[value];
+  return null;
+}
+
 function parseReminderConfig(text) {
   const input = normalizeInput(text);
   if (/不提醒/.test(input)) return { mode: "none" };
-  let m = input.match(/提醒\s*(\d+)\s*分/);
-  if (m) return { mode: "before", minutes: Number(m[1]) };
-  m = input.match(/提醒\s*(\d+)\s*(?:小時|hr|h)/i);
-  if (m) return { mode: "before", minutes: Number(m[1]) * 60 };
+  let m = input.match(/提醒\s*([0-9零〇一二兩三四五六七八九十]+)\s*(?:分鐘|分)/);
+  if (m) return { mode: "before", minutes: parseChineseNumber(m[1]) };
+  m = input.match(/提醒\s*([0-9零〇一二兩三四五六七八九十]+)\s*(?:小時|hr|h)/i);
+  if (m) return { mode: "before", minutes: parseChineseNumber(m[1]) * 60 };
   if (/提醒前一天|前一天晚上提醒|前一天提醒/.test(input)) return { mode: "preset", preset: "day_before" };
   if (/提醒當天早上|當天早上提醒/.test(input)) return { mode: "preset", preset: "morning" };
   m = input.match(/提醒我?(?:早上|上午)?\s*(\d{1,2})[:.：點]?(\d{0,2})/);
@@ -727,8 +742,8 @@ function parseReminderConfig(text) {
 function stripReminderConfig(text) {
   return text
     .replace(/\s*不提醒\s*$/, "")
-    .replace(/\s*提醒\s*\d+\s*分\s*$/, "")
-    .replace(/\s*提醒\s*\d+\s*(?:小時|hr|h)\s*$/i, "")
+    .replace(/\s*提醒\s*[0-9零〇一二兩三四五六七八九十]+\s*(?:分鐘|分)\s*$/, "")
+    .replace(/\s*提醒\s*[0-9零〇一二兩三四五六七八九十]+\s*(?:小時|hr|h)\s*$/i, "")
     .replace(/\s*(?:提醒前一天|前一天晚上提醒|前一天提醒|提醒當天早上|當天早上提醒)\s*$/, "")
     .replace(/\s*提醒我?(?:早上|上午)?\s*\d{1,2}[:.：點]?\d{0,2}\s*$/, "")
     .trim();
