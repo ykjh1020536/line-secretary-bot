@@ -11,6 +11,8 @@ const DATA_FILE = path.join(__dirname, "data", "tasks.json");
 const STORE_ID = process.env.SUPABASE_STORE_ID || "line-secretary-bot";
 const TZ = "Asia/Taipei";
 const ARCHIVE_GRACE_MINUTES = 30;
+const OPENAI_MODEL = process.env.OPENAI_MODEL || "gpt-5-mini";
+const AI_INTENT_CONFIDENCE = 0.75;
 
 const lineConfig = {
   channelAccessToken: process.env.LINE_CHANNEL_ACCESS_TOKEN,
@@ -251,7 +253,15 @@ function rememberPerson(scope, person, userId) {
 }
 
 function attachMention(scope, parsed, targets) {
-  if (!parsed || parsed.type === "split" || !parsed.person) return parsed;
+  if (!parsed) return parsed;
+  if (parsed.type === "split") {
+    for (const person of parsed.people || []) {
+      const hit = targets.find((t) => t.name === person || t.label === person || `@${t.name}` === person);
+      if (hit) rememberPerson(scope, person, hit.userId);
+    }
+    return parsed;
+  }
+  if (!parsed.person) return parsed;
   const hit = targets.find((t) => t.name === parsed.person || t.label === parsed.person || `@${t.name}` === parsed.person);
   if (hit) {
     parsed.mentionUserId = hit.userId;
@@ -357,6 +367,106 @@ function parseBarePaid(text) {
   if (!m) return null;
   const parsed = parseAmount(m[1]);
   return parsed ? { type: "payment", direction: "paid_to_them", ...parsed } : null;
+}
+
+function shouldUseAiIntent(text) {
+  const input = normalizeInput(text);
+  if (!process.env.OPENAI_API_KEY) return false;
+  if (!input || input.startsWith("/")) return false;
+  if (isCountdownText(input)) return false;
+  return /[@欠還給分帳行程提醒今天明天後天週星期禮拜下週下禮拜早上下午晚上\d]/.test(input);
+}
+
+function extractResponseText(data) {
+  if (typeof data?.output_text === "string") return data.output_text;
+  const parts = [];
+  for (const item of data?.output || []) {
+    for (const content of item.content || []) {
+      if (content.type === "output_text" && content.text) parts.push(content.text);
+    }
+  }
+  return parts.join("");
+}
+
+async function aiRecognizeIntent(text, targets = []) {
+  if (!shouldUseAiIntent(text)) return null;
+  const now = nowParts();
+  const mentionNames = targets.map((t) => `@${t.name}`).join(", ") || "無";
+  const payload = {
+    model: OPENAI_MODEL,
+    input: [
+      {
+        role: "system",
+        content: [
+          "你是 LINE 生活秘書的指令辨識器，只輸出 JSON。",
+          "你的工作是把自然語言改寫成 bot 已支援的標準指令，不要新增資料、不回答問題。",
+          "只處理帳務、行程、提醒查詢、行程查詢、欠款查詢。一般聊天輸出 intent=none。",
+          "人名如果是 LINE 標記，盡量保留 @名字。",
+          "不要把「還有7分鐘」這種倒數句當成還款。",
+          "行程日期用台灣時間，今天日期由 user 提供。",
+        ].join("\n"),
+      },
+      {
+        role: "user",
+        content: [
+          `今天：${now.year}/${pad(now.month)}/${pad(now.day)} ${pad(now.hour)}:${pad(now.minute)} Asia/Taipei`,
+          `可用標記：${mentionNames}`,
+          `原始訊息：${text}`,
+          "",
+          "標準化範例：",
+          "欠@A 250 => 欠 @A 250",
+          "@A 要給我120 => @A 要給我 120",
+          "還@A 350 => 還 @A 350",
+          "分帳 2000 @A @B => 分帳 2000 @A @B",
+          "明天9要剪毛提醒5分鐘 => 明天 9:00 要剪毛 提醒5分鐘",
+          "明天 9.要剪毛 提醒五分鐘 => 明天 9:00 要剪毛 提醒5分鐘",
+          "我的行程勒 => /行程",
+          "欠款勒 => /欠",
+        ].join("\n"),
+      },
+    ],
+    text: {
+      format: {
+        type: "json_schema",
+        name: "line_secretary_intent",
+        strict: true,
+        schema: {
+          type: "object",
+          additionalProperties: false,
+          properties: {
+            intent: {
+              type: "string",
+              enum: ["none", "debt", "event", "debt_query", "event_query", "reminder_query"],
+            },
+            normalized: { type: "string" },
+            confidence: { type: "number" },
+          },
+          required: ["intent", "normalized", "confidence"],
+        },
+      },
+    },
+  };
+
+  try {
+    const response = await fetch("https://api.openai.com/v1/responses", {
+      method: "POST",
+      headers: {
+        Authorization: `Bearer ${process.env.OPENAI_API_KEY}`,
+        "Content-Type": "application/json",
+      },
+      body: JSON.stringify(payload),
+    });
+    if (!response.ok) {
+      console.error("OpenAI intent failed", response.status, await response.text());
+      return null;
+    }
+    const parsed = JSON.parse(extractResponseText(await response.json()) || "{}");
+    if (!parsed || parsed.confidence < AI_INTENT_CONFIDENCE || parsed.intent === "none") return null;
+    return parsed;
+  } catch (error) {
+    console.error("OpenAI intent error", error);
+    return null;
+  }
 }
 
 function parseSplit(input) {
@@ -691,7 +801,7 @@ function applyBarePaid(store, scope, parsed, raw) {
 function parseEvent(text, options = {}) {
   const reminderConfig = parseReminderConfig(text);
   const input = stripReminderConfig(normalizeInput(text));
-  let m = input.match(/^(今天|明天|後天)\s+(\d{1,2})[:.：](\d{0,2})\s*(.+)$/);
+  let m = input.match(/^(今天|明天|後天)\s*(\d{1,2})[:.：](\d{0,2})\s*(.+)$/);
   if (m) {
     const base = addDays(taipeiToday(), { 今天: 0, 明天: 1, 後天: 2 }[m[1]]);
     return withReminderConfig(eventFromParts(base.getFullYear(), base.getMonth() + 1, base.getDate(), Number(m[2]), Number(m[3] || 0), m[4]), reminderConfig);
@@ -977,11 +1087,22 @@ function handleReminderAction(scope, input) {
 
 function updateEventReminder(event, rest) {
   const config = parseReminderConfig(rest);
-  if (!config) return false;
+  if (!config) return { ok: false, reason: "parse" };
+  const reminderOptOut = config.mode === "none";
+  const originalConfig = event.reminderConfig;
+  const originalOptOut = event.reminderOptOut;
+  const originalReminders = event.reminders;
   event.reminderConfig = config;
-  event.reminderOptOut = config.mode === "none";
-  event.reminders = buildReminders(event);
-  return true;
+  event.reminderOptOut = reminderOptOut;
+  const reminders = buildReminders(event);
+  event.reminderConfig = originalConfig;
+  event.reminderOptOut = originalOptOut;
+  event.reminders = originalReminders;
+  if (!reminderOptOut && !reminders.length) return { ok: false, reason: "past" };
+  event.reminderConfig = config;
+  event.reminderOptOut = reminderOptOut;
+  event.reminders = reminders;
+  return { ok: true };
 }
 
 function formatDateTime(iso) {
@@ -1128,10 +1249,16 @@ async function handleText(message, source) {
     const item = scope.events.find((e) => e.id.toUpperCase() === id && !e.deleted);
     if (!id || !rest) reply = "用法：/改提醒 E2 提醒30分";
     else if (!item) reply = `找不到 ${id}`;
-    else if (!updateEventReminder(item, rest)) reply = "改不了提醒，例：/改提醒 E2 提醒30分";
     else {
+      const reminderResult = updateEventReminder(item, rest);
+      if (!reminderResult.ok && reminderResult.reason === "past") {
+        reply = `提醒時間已經過了，沒有修改。\n${formatEvent(item)}\n\n如果這筆是晚上 20:00，請先打：\n/改行程 ${item.id} 今天 20:00 ${item.title.replace(/^\d{1,2}[.:：]\s*/, "")}`;
+      } else if (!reminderResult.ok) {
+        reply = "改不了提醒，例：/改提醒 E2 提醒30分";
+      } else {
       reply = `已修改提醒 ${item.id}\n${formatEvent(item)}\n提醒：${formatReminderSummary(item)}`;
       changed = true;
+      }
     }
   } else if (input.startsWith("/行程")) {
     reply = eventList(scope, input.replace("/行程", "").trim());
@@ -1188,6 +1315,33 @@ async function handleText(message, source) {
       if (event) {
         reply = applyEvent(store, scope, event);
         changed = true;
+      }
+
+      if (!reply) {
+        const ai = await aiRecognizeIntent(message.text, targets);
+        if (ai?.intent === "debt_query") {
+          const filter = ai.normalized.replace(/^\/欠/, "").trim();
+          reply = debtSummary(scope, filter);
+        } else if (ai?.intent === "event_query") {
+          const filter = ai.normalized.replace(/^\/行程/, "").trim();
+          reply = eventList(scope, filter);
+        } else if (ai?.intent === "reminder_query") {
+          reply = reminderList(scope);
+        } else if (ai?.intent === "debt") {
+          const aiDebt = parseDebt(ai.normalized, null);
+          if (aiDebt) {
+            const normalizedDebt = normalizeParsedDebtPerson(scope, aiDebt);
+            attachMention(scope, normalizedDebt, targets);
+            reply = applyDebt(store, scope, normalizedDebt, ai.normalized);
+            changed = true;
+          }
+        } else if (ai?.intent === "event") {
+          const aiEvent = parseEvent(ai.normalized);
+          if (aiEvent) {
+            reply = applyEvent(store, scope, aiEvent);
+            changed = true;
+          }
+        }
       }
     }
   }

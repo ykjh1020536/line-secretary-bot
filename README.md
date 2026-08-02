@@ -51,6 +51,25 @@ A 還我 200
 
 一般聊天不會回覆，避免太吵。
 
+## AI 辨識
+
+可選功能。Render 有填 `OPENAI_API_KEY` 時，Bot 會多一層 AI 解析：
+
+```text
+明天9要剪毛提醒五分鐘
+我的行程勒
+欠款勒
+```
+
+AI 只負責把自然語言改成標準指令，實際記帳和行程仍走原本程式邏輯。AI 失敗時會自動退回規則版。
+
+Render 環境變數：
+
+```text
+OPENAI_API_KEY
+OPENAI_MODEL=gpt-5-mini
+```
+
 ## Supabase
 
 在 Supabase SQL Editor 執行：
