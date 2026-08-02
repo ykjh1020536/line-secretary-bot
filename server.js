@@ -432,12 +432,26 @@ function debtSigned(item) {
 function debtSummary(scope, person) {
   reconcileOffsets(scope);
   const target = cleanPersonName(person || "");
-  const rows = scope.debts.filter((d) => !d.deleted && !d.offsetBy && (!target || d.person === target));
+  const targetUserId = target ? personUserId(scope, target) : null;
+  const rows = scope.debts.filter((d) => {
+    if (d.deleted || d.offsetBy) return false;
+    if (!target) return true;
+    const rowPersonUserId = d.mentionUserId || personUserId(scope, d.person);
+    return d.person === target || (targetUserId && rowPersonUserId === targetUserId);
+  });
   const totals = new Map();
   for (const row of rows) {
     const actor = debtActorName(scope, row);
-    const key = `${actor}\u0000${row.person}`;
-    const current = totals.get(key) || { actor, person: row.person, value: 0 };
+    const actorUserId = row.actorUserId || personUserId(scope, actor) || "";
+    const personUserIdValue = row.mentionUserId || personUserId(scope, row.person) || "";
+    const actorKey = actorUserId || actor;
+    const personKeyValue = personUserIdValue || row.person;
+    const key = `${actorKey}\u0000${personKeyValue}`;
+    const current = totals.get(key) || { actor, actorUserId, person: row.person, personUserId: personUserIdValue, value: 0 };
+    if (!current.actorUserId && actorUserId) current.actorUserId = actorUserId;
+    if (!current.personUserId && personUserIdValue) current.personUserId = personUserIdValue;
+    if (current.actor === "你" && actor !== "你") current.actor = actor;
+    if (current.person === "你" && row.person !== "你") current.person = row.person;
     current.value += debtSigned(row);
     totals.set(key, current);
   }
@@ -578,9 +592,9 @@ function formatDebtLine(d, scope) {
   const person = mentionToken(scope, d.person);
   const actor = mentionToken(scope, debtActorName(scope, d));
   if (d.direction === "me_owe") return `${actor} 欠 ${person} ${formatMoney(d.amount)}`;
-  if (d.direction === "they_owe") return `${person} 欠${actor} ${formatMoney(d.amount)}`;
+  if (d.direction === "they_owe") return `${person} 欠 ${actor} ${formatMoney(d.amount)}`;
   if (d.direction === "paid_to_them") return `${actor} 還 ${person} ${formatMoney(d.amount)}`;
-  return `${person} 還${actor} ${formatMoney(d.amount)}`;
+  return `${person} 還 ${actor} ${formatMoney(d.amount)}`;
 }
 
 function oppositeDirections(a, b) {
