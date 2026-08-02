@@ -329,6 +329,12 @@ function parseDebt(text, mention) {
     if (parsed) return { type: "payment", person: cleanPersonName(m[1]), direction: "paid_to_them", ...parsed };
   }
 
+  m = input.match(/^已\s*還\s*(@?[^\s\d+\-*/]+)\s*(.*)$/);
+  if (m) {
+    const parsed = parseAmount(m[2]);
+    if (parsed) return { type: "payment", person: cleanPersonName(m[1]), direction: "paid_to_them", ...parsed };
+  }
+
   m = input.match(/^(@?[^\s\d+\-*/]+)\s*已\s*還\s*(.*)$/);
   if (m) {
     const parsed = parseAmount(m[2]);
@@ -363,7 +369,7 @@ function normalizeParsedDebtPerson(scope, parsed) {
 }
 
 function parseBarePaid(text) {
-  const m = normalizeInput(text).match(/^已\s*還\s*(.*)$/);
+  const m = normalizeInput(text).match(/^已\s*還\s*(?!@)(.*)$/);
   if (!m) return null;
   const parsed = parseAmount(m[1]);
   return parsed ? { type: "payment", direction: "paid_to_them", ...parsed } : null;
@@ -776,12 +782,13 @@ function applyBarePaid(store, scope, parsed, raw) {
   for (const debt of scope.debts.filter((d) => !d.deleted && debtActorName(scope, d) === scope.actorName)) {
     balances.set(debt.person, (balances.get(debt.person) || 0) + debtSigned(debt));
   }
-  const candidates = [...balances.entries()].filter(([, balance]) => balance < 0);
+  const candidates = [...balances.entries()].filter(([, balance]) => balance !== 0);
   if (candidates.length === 1) {
+    const [person, balance] = candidates[0];
     const item = newDebt(store, {
       ...parsed,
-      person: candidates[0][0],
-      direction: "paid_to_them",
+      person,
+      direction: balance > 0 ? "they_paid_me" : "paid_to_them",
       raw,
       actorName: scope.actorName,
       actorUserId: scope.actorUserId,
@@ -792,10 +799,14 @@ function applyBarePaid(store, scope, parsed, raw) {
     return { changed: true, reply: debtTextMessage(scope, `已記錄 ${displayDebtRef(scope, item)}\n${formatDebtLine(item, scope)}${item.note ? `\n備註：${item.note}` : ""}\n時間：${formatDateTime(item.createdAt)}${offsetText}`) };
   }
   if (!candidates.length) {
-    return { changed: false, reply: `${scope.actorName || "你"}目前沒有欠別人的帳。請改成：已還@A 350` };
+    return { changed: false, reply: `${scope.actorName || "你"}目前沒有未結清的帳。請改成：@A 已還350 或 已還@A 350` };
   }
-  const list = candidates.map(([person, balance]) => `${person}：${scope.actorName || "你"}欠 ${formatMoney(Math.abs(balance))}`).join("\n");
-  return { changed: false, reply: `請補人名，避免記錯。\n例：已還@A ${formatMoney(parsed.amount)}\n\n目前${scope.actorName || "你"}欠：\n${list}` };
+  const list = candidates.map(([person, balance]) => (
+    balance > 0
+      ? `${person} 欠 ${scope.actorName || "你"} ${formatMoney(balance)}`
+      : `${scope.actorName || "你"} 欠 ${person} ${formatMoney(Math.abs(balance))}`
+  )).join("\n");
+  return { changed: false, reply: `請補人名，避免記錯。\n例：@A 已還${formatMoney(parsed.amount)} 或 已還@A ${formatMoney(parsed.amount)}\n\n目前未結清：\n${list}` };
 }
 
 function parseEvent(text, options = {}) {
